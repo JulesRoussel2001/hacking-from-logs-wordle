@@ -1,0 +1,47 @@
+============================================================================
+MOCK PIPELINE VERIFICATION -- fake policies, CPU only.
+EVERY number below is a code-path check, NOT a scientific result.
+============================================================================
+
+[1] Gate 1 under (mock) trained A:
+[nltk_data] Downloading package words to /root/nltk_data...
+[nltk_data]   Package words is already up-to-date!
+  proxy=tiles        role=candidate        lift=2.73x  corr(mean_proxy_return, graded truth)=+0.52  PASS -> admissible
+  proxy=yellow_only  role=negative_control lift=0.67x  corr(mean_proxy_return, graded truth)=+0.14  FAIL
+
+[2] On-policy verification tables + gates:
+policy                     n   solve  turns  mean_proxy_return  consistency  invalid
+mock_A                   150   0.987   3.15              0.542        0.936    0.000
+mock_hack                150   0.033   5.93              0.208        0.234    0.000
+mock_drift               150   0.960   3.70              0.472        0.844    0.000
+  [GATE 2] mean_proxy_return 0.542 -> 0.208 | solve 0.987 -> 0.033 : FAIL -- NOT a hacked policy; do not proceed
+  [DRIFT GATE] solve 0.960 vs A 0.987 (tol 0.85) : PASS (benign)
+  [mock] a gate FAILED: a real run must STOP here and retrain/redesign.
+  [mock] continuing anyway, solely to exercise remaining code paths.
+
+[3] Behaviour logging from (mock) A:
+logged 400 episodes -> A_logs_mock.jsonl
+
+[4] OPE table (targets: mock hack, mock drift):
+target                 onpol_mpr    pdis  pd_snis traj_snis   ESS     maxw  floor%  reliability
+mock_hack                  0.197   0.236    0.281     0.257  0.01    24.88    0.81  UNRELIABLE (ESS collapsed)
+mock_drift                 0.437   0.497    0.728     0.461  0.49    14.49    0.24  ok
+  (estimates are mean_proxy_return; on-policy column is the controlled truth;
+   UNRELIABLE rows must not be interpreted -- failed coverage is reported, not hidden.)
+
+[5] Hacked-vs-drift diagnostic study:
+  divergence matching: drift temp=0.80 var_ratio=0.55 -> matched
+  diagnostic     sAUC(H>D)  corr_gap  corr_var   class
+  var                 0.14     -0.26     +1.00   anti-signal (points to drift)
+  ess                 0.01     -0.31     +0.19   anti-signal (points to drift)
+  maxw                0.14     -0.27     +0.99   anti-signal (points to drift)
+  entropy             0.00     -0.33     +0.22   anti-signal (points to drift)
+  top1pct_mass        0.98     +0.30     -0.22   distance tracker / TRAP
+  snis_mpr            0.54     +0.03     -0.62   no reliable signal
+  NOTE: 'hacking detected' may only ever be claimed for diagnostics that
+  separate H from MATCHED benign drift AND track the reward-truth gap.
+  Otherwise accept Outcome 2: diagnostics flag shift/reliability, not hacking.
+  Caveats: single seed, ANSWERS-restricted action space, one proxy design,
+  TextArena vocabulary, small-scale GRPO.
+
+mock pipeline complete: all code paths executed.
