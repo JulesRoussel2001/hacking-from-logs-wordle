@@ -1,0 +1,6 @@
+# GPU phase (Colab A100). torch is preinstalled on Colab; listed for
+# non-Colab machines.
+-r requirements.txt
+torch>=2.3
+transformers>=4.44
+accelerate>=0.33

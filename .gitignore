@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/ .venv/
+
+# downloaded / generated at runtime
+answers.txt
+nltk_data/
+*_mock.jsonl
+A_logs*.jsonl
+gate1_mock.json
+run*.log
+pilot.log
+
+# GPU artifacts
+ckpt_*/
+*.safetensors
+*.bin
