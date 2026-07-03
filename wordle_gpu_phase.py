@@ -251,6 +251,8 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
                 lp_vec = _grad_logsoftmax(pol, hist)       # torch (N,), with grad
                 key = tuple(hist)
                 if key not in ref_cache:                   # frozen ref: cache log-dist
+                    if len(ref_cache) > 5000:              # hygiene cap (~5MB max)
+                        ref_cache.clear()
                     with torch.no_grad():
                         ref_cache[key] = _grad_logsoftmax(ref, hist).detach()
                 ref_vec = ref_cache[key]
@@ -289,7 +291,11 @@ def _grad_logsoftmax(pol, history):
     p_ids = pol.tok(prompt, add_special_tokens=False).input_ids
     pad = pol.tok.pad_token_id if pol.tok.pad_token_id is not None else pol.tok.eos_token_id
     scores = []
-    gbw = min(pol.batch_words, 16)      # small chunks under autograd (memory)
+    # gbw=8: real 6-turn episodes have ~45% longer prompts than smoke's short
+    # games; at gbw=16 the activation peak crept past 39GiB and OOM'd at
+    # group ~25. Halving the chunk halves per-chunk activations (~10-15%
+    # slower). The structural fix is KV-prefix caching (planned).
+    gbw = min(pol.batch_words, 8)
     ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
                         enabled=("cuda" in str(pol.device)))
     for s0 in range(0, N, gbw):
