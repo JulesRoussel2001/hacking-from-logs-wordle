@@ -1,4 +1,3 @@
-
 """
 GPU/GRPO PHASE -- reward-hacking-from-logs on TextArena Wordle (v1)
 ===================================================================
@@ -41,6 +40,7 @@ import hashlib
 import json
 import os
 import numpy as np
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
  
 from wordle_real_stack import (
     ANSWERS, N, MAX_TURNS, EPS_EXPLORE, SCHEMA_VERSION,
@@ -100,7 +100,9 @@ class HFWordlePolicy(HFPolicy):
         prompt = PROMPT_TEMPLATE.format(history=render_history(history))
         p_ids = self.tok(prompt, add_special_tokens=False).input_ids
         lps = np.full(N, -np.inf)
-        with torch.no_grad():
+        ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                            enabled=("cuda" in str(self.device)))
+        with torch.no_grad(), ac:
             for s in range(0, N, self.batch_words):
                 chunk = list(range(s, min(s + self.batch_words, N)))
                 seqs = [p_ids + self.word_ids[i] for i in chunk]
@@ -185,12 +187,12 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
         assert proxy in rep["admissible"], \
             f"proxy {proxy!r} not Gate-1 admissible under trained A: {rep['admissible']}"
         assert PROXIES[proxy]["role"] == "candidate", "negative controls are untrainable"
-    # TRAIN IN FP32. bf16 master weights truncate micro-updates: at lr~2e-6
-    # the AdamW step is ~40x below the bf16 ulp of typical weights (~8e-5), so
-    # most updates round to zero and the survivors apply as biased noise --
-    # consistent with the observed cross-run degradation (both sparse and
-    # dense rewards declined to floor with the same shape). The frozen
-    # reference stays bf16 (inference only).
+    # MIXED PRECISION: fp32 MASTER WEIGHTS (bf16 masters truncate AdamW
+    # micro-updates -- at lr~2e-6 the step is ~40x below the bf16 ulp, the
+    # suspected cause of cross-run degradation) with BF16 AUTOCAST COMPUTE
+    # in the forward passes (full-fp32 activations OOM'd a 40GB A100: fp32
+    # doubled ~19GB of activations on top of tripled optimizer state).
+    # The frozen reference stays bf16 (inference only).
     pol = HFWordlePolicy(checkpoint, temp=temp, dtype=__import__("torch").float32)
     ref = HFWordlePolicy(checkpoint, temp=temp)          # frozen reference for KL
     pol.model.train()                                    # trainable policy: train mode
@@ -287,7 +289,9 @@ def _grad_logsoftmax(pol, history):
     p_ids = pol.tok(prompt, add_special_tokens=False).input_ids
     pad = pol.tok.pad_token_id if pol.tok.pad_token_id is not None else pol.tok.eos_token_id
     scores = []
-    gbw = min(pol.batch_words, 32)      # smaller chunks under autograd
+    gbw = min(pol.batch_words, 16)      # small chunks under autograd (memory)
+    ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                        enabled=("cuda" in str(pol.device)))
     for s0 in range(0, N, gbw):
         chunk = list(range(s0, min(s0 + gbw, N)))
         seqs = [p_ids + pol.word_ids[i] for i in chunk]
@@ -295,7 +299,8 @@ def _grad_logsoftmax(pol, history):
         inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs], device=pol.device)
         att = torch.tensor([[1] * len(x) + [0] * (L - len(x)) for x in seqs],
                            device=pol.device)
-        logits = pol.model(input_ids=inp, attention_mask=att).logits
+        with ac:   # bf16 compute; grads land in fp32 master weights
+            logits = pol.model(input_ids=inp, attention_mask=att).logits
         off = len(p_ids)
         maxw = max(len(pol.word_ids[i]) for i in chunk)
         # MEMORY: window-sliced softmax (see _sequence_logprobs)
