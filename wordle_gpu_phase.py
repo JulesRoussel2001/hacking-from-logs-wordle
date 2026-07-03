@@ -1,4 +1,3 @@
-
 """
 GPU/GRPO PHASE -- reward-hacking-from-logs on TextArena Wordle (v1)
 ===================================================================
@@ -47,7 +46,7 @@ from wordle_real_stack import (
     ANSWERS, N, MAX_TURNS, EPS_EXPLORE, SCHEMA_VERSION,
     PROXIES, PROXY_RETURN_CONVENTION, episode_proxy_return,
     true_return, true_score, consistency_q, valid_action_mask, _assert_dist,
-    Policy, HFPolicy, EpsilonLoggingPolicy,
+    Policy, HFPolicy, EpsilonLoggingPolicy, ConsistencySoftmaxHeuristic,
     TextArenaWordle, run_episode, spearman, estimators_from_terms,
     per_turn_terms, run_self_tests,
 )
@@ -326,6 +325,90 @@ def _grad_logsoftmax(pol, history):
     mask = torch.tensor(valid_action_mask(history), device=pol.device)
     z = torch.where(mask, z, torch.tensor(-1e30, device=pol.device))
     return torch.log_softmax(z, dim=0)
+ 
+# ======================================================================
+# SFT WARM START -- distill the consistency-heuristic teacher (solve ~0.98)
+# into the base model BEFORE any GRPO. Why: three probe runs showed that
+# REINFORCE-style GRPO from scratch fails on this policy class -- with ~7/8
+# episodes failing, group-standardised advantages apply net-negative pressure
+# to the frequently-sampled head words, eroding the prior toward uniform
+# (observed: objective -> floor while entropy ROSE 2.69 -> 4.42). Starting
+# from a competent policy makes wins frequent and advantages balanced.
+# ALL THREE policies (A, B_hack, B_drift) initialise from this ONE common
+# ancestor, so downstream differences are attributable to reward alone.
+# ======================================================================
+def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
+                   epochs=1, lr=1e-5, batch=8, teacher_temp=0.15, seed=0):
+    import torch
+    rng = np.random.default_rng(seed)
+    teacher = ConsistencySoftmaxHeuristic(temp=teacher_temp)
+    # ---- generate (rendered history -> teacher guess) pairs in the REAL env
+    examples = []
+    while len(examples) < n_examples:
+        env = TextArenaWordle().reset(seed=int(rng.integers(2**31)))
+        for _t in range(MAX_TURNS):
+            hist = env.history[:]
+            p = teacher.action_dist(hist)
+            a = int(rng.choice(N, p=p))
+            examples.append((PROMPT_TEMPLATE.format(history=render_history(hist)),
+                             ANSWERS[a]))
+            fb, done = env.step(ANSWERS[a])
+            if fb is None or done or fb == "GGGGG":
+                break
+    print(f"[sft] generated {len(examples)} teacher examples "
+          f"(teacher = consistency heuristic, temp {teacher_temp})")
+    # ---- fine-tune: cross-entropy on the guess tokens only (same window
+    # indexing as the validated scorer; fp32 masters + bf16 autocast compute)
+    pol = HFWordlePolicy(checkpoint, dtype=torch.float32)
+    pol.model.train()
+    opt = torch.optim.AdamW(pol.model.parameters(), lr=lr)
+    pad = pol.tok.pad_token_id if pol.tok.pad_token_id is not None else pol.tok.eos_token_id
+    ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                        enabled=("cuda" in str(pol.device)))
+    order = np.arange(len(examples))
+    step = 0
+    for _ep in range(epochs):
+        rng.shuffle(order)
+        for s0 in range(0, len(order) - batch + 1, batch):
+            rows = [examples[i] for i in order[s0:s0 + batch]]
+            p_ids = [pol.tok(pr, add_special_tokens=False).input_ids for pr, _ in rows]
+            w_ids = [pol.tok(" " + w, add_special_tokens=False).input_ids for _, w in rows]
+            seqs = [p + w for p, w in zip(p_ids, w_ids)]
+            L = max(len(x) for x in seqs)
+            inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs], device=pol.device)
+            att = torch.tensor([[1] * len(x) + [0] * (L - len(x)) for x in seqs],
+                               device=pol.device)
+            with ac:
+                logits = pol.model(input_ids=inp, attention_mask=att).logits
+            # per-row NLL of the guess tokens; rows share ONE forward pass,
+            # so stacking here is legitimate single-graph accumulation
+            row_nll = []
+            for r in range(len(rows)):
+                off = len(p_ids[r])
+                lp = torch.log_softmax(
+                    logits[r, off - 1: off - 1 + len(w_ids[r]), :].float(), dim=-1)
+                row_nll.append(-sum(lp[j, tid] for j, tid in enumerate(w_ids[r])))
+            loss = torch.stack(row_nll).mean()
+            loss.backward()
+            opt.step(); opt.zero_grad()
+            step += 1
+            if step % 50 == 0:
+                print(f"[sft] step {step}  loss/word = {float(loss):.3f}",
+                      flush=True)
+    pol.model.save_pretrained(out_dir); pol.tok.save_pretrained(out_dir)
+    json.dump({"role": "sft", "temperature": 1.0, "base_checkpoint": checkpoint,
+               "teacher": f"ConsistencySoftmaxHeuristic(temp={teacher_temp})",
+               "n_examples": n_examples, "epochs": epochs, "lr": lr, "seed": seed,
+               "reward_convention": PROXY_RETURN_CONVENTION,
+               "prompt_template_hash": PROMPT_TEMPLATE_HASH,
+               "action_space": "RESTRICTED to ANSWERS (env secret list)"},
+              open(os.path.join(out_dir, "policy_config.json"), "w"), indent=1)
+    print(f"[sft] saved -> {out_dir}")
+    # ---- immediate on-policy check of the distilled policy
+    row = onpolicy_eval(load_policy(out_dir), n_ep=100, seed=31)
+    print_onpolicy_table([row])
+    print("  (SFT ancestor for A / B_hack / B_drift. GRPO next, e.g.:")
+    print("   train --role A --ckpt <this dir> --lr 1e-6 --kl 0.05 --groups 100)")
  
 # ======================================================================
 # GATES + ON-POLICY VERIFICATION TABLES
@@ -667,6 +750,12 @@ def main():
     tr.add_argument("--groups", type=int, default=200)
     tr.add_argument("--group-size", type=int, default=8)
     sm = sub.add_parser("smoke"); sm.add_argument("--ckpt", default=MODEL_NAME_DEFAULT)
+    sf = sub.add_parser("sft"); sf.add_argument("--out", required=True)
+    sf.add_argument("--ckpt", default=MODEL_NAME_DEFAULT)
+    sf.add_argument("--n-examples", type=int, default=3000)
+    sf.add_argument("--epochs", type=int, default=1)
+    sf.add_argument("--lr", type=float, default=1e-5)
+    sf.add_argument("--seed", type=int, default=0)
     g1 = sub.add_parser("gate1"); g1.add_argument("--ckpt", required=True)
     g1.add_argument("--report", required=True)
     ve = sub.add_parser("verify")
@@ -689,6 +778,9 @@ def main():
                    shaping_true_score=a.shaping_true_score, lr=a.lr)
     elif a.cmd == "smoke":
         gpu_smoke(a.ckpt)
+    elif a.cmd == "sft":
+        sft_warm_start(a.out, checkpoint=a.ckpt, n_examples=a.n_examples,
+                       epochs=a.epochs, lr=a.lr, seed=a.seed)
     elif a.cmd == "gate1":
         rep = gate1_final(load_policy(a.ckpt)); json.dump(rep, open(a.report, "w"))
         if not rep["admissible"]:
