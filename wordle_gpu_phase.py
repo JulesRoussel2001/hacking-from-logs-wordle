@@ -338,25 +338,49 @@ def _grad_logsoftmax(pol, history):
 # ancestor, so downstream differences are attributable to reward alone.
 # ======================================================================
 def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
-                   epochs=1, lr=1e-5, batch=8, teacher_temp=0.15, seed=0):
+                   epochs=1, lr=1e-5, batch=8, teacher_temp=0.15, seed=0,
+                   turn1_frac=0.02):
+    """DATA-QUALITY RULES (learned from SFT1's solve=0.01):
+    On empty history every word is consistent, so the teacher is UNIFORM on
+    turn 1 -- cross-entropy toward a uniform target actively FLATTENS the
+    base model's decent opener prior (apple/quick/peace), and more data makes
+    that worse, not better. Fix: cap empty-history examples at turn1_frac
+    (default 2%) and let base Qwen keep its own opener prior untouched.
+    (Lowering teacher_temp does NOT fix this: softmax of equal scores is
+    uniform at every temperature; mid-game the consistent set already gets an
+    ~800:1 edge at temp 0.15.) Feedback LOGIC is what SFT must install, and
+    that lives in mid-game states -- which now dominate the dataset."""
     import torch
     rng = np.random.default_rng(seed)
     teacher = ConsistencySoftmaxHeuristic(temp=teacher_temp)
-    # ---- generate (rendered history -> teacher guess) pairs in the REAL env
-    examples = []
-    while len(examples) < n_examples:
+    # ---- generate pairs in the REAL env, bucketed by turn-1 vs mid-game
+    n_t1_max = max(1, int(turn1_frac * n_examples))
+    mid, t1, solves, n_ep = [], [], 0, 0
+    while len(mid) < n_examples - n_t1_max:
         env = TextArenaWordle().reset(seed=int(rng.integers(2**31)))
+        n_ep += 1
         for _t in range(MAX_TURNS):
             hist = env.history[:]
             p = teacher.action_dist(hist)
             a = int(rng.choice(N, p=p))
-            examples.append((PROMPT_TEMPLATE.format(history=render_history(hist)),
-                             ANSWERS[a]))
+            ex = (PROMPT_TEMPLATE.format(history=render_history(hist)), ANSWERS[a],
+                  len(hist))
+            (t1 if not hist else mid).append(ex)
             fb, done = env.step(ANSWERS[a])
+            if fb == "GGGGG": solves += 1
             if fb is None or done or fb == "GGGGG":
                 break
-    print(f"[sft] generated {len(examples)} teacher examples "
-          f"(teacher = consistency heuristic, temp {teacher_temp})")
+    examples = [(pr, w) for pr, w, _ in mid[:n_examples - n_t1_max]] +                [(pr, w) for pr, w, _ in t1[:n_t1_max]]
+    rng.shuffle(examples)
+    # ---- dataset diagnostics (printed BEFORE burning GPU time)
+    turns = [t for _, _, t in mid[:n_examples - n_t1_max]] + [0] * min(len(t1), n_t1_max)
+    uniq = len({w for _, w in examples})
+    print(f"[sft] dataset: {len(examples)} examples from {n_ep} teacher episodes "
+          f"(teacher solve rate {solves / n_ep:.2f})")
+    print(f"[sft]   empty-history fraction = {turns.count(0) / len(turns):.3f} "
+          f"(cap {turn1_frac}) | unique target words = {uniq}/{N}")
+    print("[sft]   turn-index distribution: " +
+          " ".join(f"t{k}:{turns.count(k)}" for k in sorted(set(turns))))
     # ---- fine-tune: cross-entropy on the guess tokens only (same window
     # indexing as the validated scorer; fp32 masters + bf16 autocast compute)
     pol = HFWordlePolicy(checkpoint, dtype=torch.float32)
@@ -393,11 +417,12 @@ def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
             opt.step(); opt.zero_grad()
             step += 1
             if step % 50 == 0:
-                print(f"[sft] step {step}  loss/word = {float(loss):.3f}",
+                print(f"[sft] step {step}  loss/word = {loss.item():.3f}",
                       flush=True)
     pol.model.save_pretrained(out_dir); pol.tok.save_pretrained(out_dir)
     json.dump({"role": "sft", "temperature": 1.0, "base_checkpoint": checkpoint,
                "teacher": f"ConsistencySoftmaxHeuristic(temp={teacher_temp})",
+               "turn1_frac": turn1_frac,
                "n_examples": n_examples, "epochs": epochs, "lr": lr, "seed": seed,
                "reward_convention": PROXY_RETURN_CONVENTION,
                "prompt_template_hash": PROMPT_TEMPLATE_HASH,
@@ -756,6 +781,7 @@ def main():
     sf.add_argument("--epochs", type=int, default=1)
     sf.add_argument("--lr", type=float, default=1e-5)
     sf.add_argument("--seed", type=int, default=0)
+    sf.add_argument("--turn1-frac", type=float, default=0.02)
     g1 = sub.add_parser("gate1"); g1.add_argument("--ckpt", required=True)
     g1.add_argument("--report", required=True)
     ve = sub.add_parser("verify")
@@ -780,7 +806,8 @@ def main():
         gpu_smoke(a.ckpt)
     elif a.cmd == "sft":
         sft_warm_start(a.out, checkpoint=a.ckpt, n_examples=a.n_examples,
-                       epochs=a.epochs, lr=a.lr, seed=a.seed)
+                       epochs=a.epochs, lr=a.lr, seed=a.seed,
+                       turn1_frac=a.turn1_frac)
     elif a.cmd == "gate1":
         rep = gate1_final(load_policy(a.ckpt)); json.dump(rep, open(a.report, "w"))
         if not rep["admissible"]:
