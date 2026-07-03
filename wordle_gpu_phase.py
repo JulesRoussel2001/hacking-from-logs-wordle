@@ -1,3 +1,4 @@
+
 """
 GPU/GRPO PHASE -- reward-hacking-from-logs on TextArena Wordle (v1)
 ===================================================================
@@ -196,6 +197,14 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
     pol = HFWordlePolicy(checkpoint, temp=temp, dtype=__import__("torch").float32)
     ref = HFWordlePolicy(checkpoint, temp=temp)          # frozen reference for KL
     pol.model.train()                                    # trainable policy: train mode
+    # GRADIENT CHECKPOINTING: autograd retains saved activations for ALL 156
+    # scored sequences until each state's backward -- independent of chunk
+    # size (halving gbw did NOT help; that analysis was wrong). Checkpointing
+    # recomputes activations in backward instead of storing them: ~10x less
+    # retained memory for ~35% more compute.
+    pol.model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
+    pol.model.config.use_cache = False
     ref.model.eval()
     for p_ in ref.model.parameters():                    # reference NEVER gets grads
         p_.requires_grad_(False)
@@ -291,11 +300,9 @@ def _grad_logsoftmax(pol, history):
     p_ids = pol.tok(prompt, add_special_tokens=False).input_ids
     pad = pol.tok.pad_token_id if pol.tok.pad_token_id is not None else pol.tok.eos_token_id
     scores = []
-    # gbw=8: real 6-turn episodes have ~45% longer prompts than smoke's short
-    # games; at gbw=16 the activation peak crept past 39GiB and OOM'd at
-    # group ~25. Halving the chunk halves per-chunk activations (~10-15%
-    # slower). The structural fix is KV-prefix caching (planned).
-    gbw = min(pol.batch_words, 8)
+    # gbw back to 16: with gradient checkpointing the retained graph is small;
+    # chunk size only affects the transient working set.
+    gbw = min(pol.batch_words, 16)
     ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
                         enabled=("cuda" in str(pol.device)))
     for s0 in range(0, N, gbw):
