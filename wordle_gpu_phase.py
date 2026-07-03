@@ -1,3 +1,4 @@
+
 """
 GPU/GRPO PHASE -- reward-hacking-from-logs on TextArena Wordle (v1)
 ===================================================================
@@ -73,15 +74,17 @@ class HFWordlePolicy(HFPolicy):
     does the masking/softmax and the loud failure checks. Raw free-form text
     probability is never used for IS. All policies (A, B_hack, B_drift) MUST
     share tokenizer + PROMPT_TEMPLATE (hash stored in log meta)."""
-    def __init__(self, checkpoint, temp=1.0, device=None, batch_words=64):
+    def __init__(self, checkpoint, temp=1.0, device=None, batch_words=64, dtype=None):
         super().__init__(checkpoint, temp=temp)
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tok = AutoTokenizer.from_pretrained(checkpoint)
+        if dtype is None:   # inference default; TRAINING must pass float32
+            dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
-            checkpoint, torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32
+            checkpoint, torch_dtype=dtype
         ).to(self.device).eval()
         self.batch_words = batch_words
         # pre-tokenise candidate words once (leading space => whole-word tokens)
@@ -182,7 +185,13 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
         assert proxy in rep["admissible"], \
             f"proxy {proxy!r} not Gate-1 admissible under trained A: {rep['admissible']}"
         assert PROXIES[proxy]["role"] == "candidate", "negative controls are untrainable"
-    pol = HFWordlePolicy(checkpoint, temp=temp)
+    # TRAIN IN FP32. bf16 master weights truncate micro-updates: at lr~2e-6
+    # the AdamW step is ~40x below the bf16 ulp of typical weights (~8e-5), so
+    # most updates round to zero and the survivors apply as biased noise --
+    # consistent with the observed cross-run degradation (both sparse and
+    # dense rewards declined to floor with the same shape). The frozen
+    # reference stays bf16 (inference only).
+    pol = HFWordlePolicy(checkpoint, temp=temp, dtype=__import__("torch").float32)
     ref = HFWordlePolicy(checkpoint, temp=temp)          # frozen reference for KL
     pol.model.train()                                    # trainable policy: train mode
     ref.model.eval()
@@ -194,7 +203,7 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
     proxy_key = f"proxy_{proxy}" if proxy else "proxy_tiles"
     for g in range(groups):
         secret_seed = int(rng.integers(2**31))
-        eps_, logps, group_eps = [], [], []
+        eps_, logps, group_eps, ent_log = [], [], [], []
         # weights are CONSTANT within a group (opt.step is per group), so the
         # policy score cache is valid across the whole group -- clear per GROUP.
         pol._cache.clear()
@@ -204,6 +213,7 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
             for _t in range(MAX_TURNS):
                 hist = env.history[:]
                 p = pol.action_dist(hist)                 # numpy (no-grad) for sampling
+                ent_log.append(float(-np.sum(p * np.log(p + 1e-12))))
                 a = int(rng.choice(N, p=p))
                 fb, done = env.step(ANSWERS[a])
                 if fb is None:
@@ -249,8 +259,14 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
         if (g + 1) % 20 == 0:
             solves = np.mean([true_return({"turns": t["turns"]})["solved"]
                               for t in group_eps])
+            # entropy diagnostic: max is ln(156)=5.05 (uniform). Entropy
+            # collapsing toward 0 alongside a falling objective = premature
+            # convergence (self-reinforcing lock-in) -- a DIFFERENT disease
+            # than bad numerics, with different cures (entropy bonus, KL up,
+            # SFT warm start).
             print(f"[{role}] group {g+1}/{groups} "
-                  f"solve = {solves:.3f} | objective = {rewards.mean():.3f}", flush=True)
+                  f"solve = {solves:.3f} | objective = {rewards.mean():.3f} "
+                  f"| entropy = {np.mean(ent_log):.2f}", flush=True)
     pol.model.save_pretrained(out_dir); pol.tok.save_pretrained(out_dir)
     json.dump({"role": role, "temperature": temp, "kl_coef": kl_coef,
                "proxy": proxy, "reward_convention": PROXY_RETURN_CONVENTION,
