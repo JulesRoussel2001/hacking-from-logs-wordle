@@ -44,7 +44,7 @@ import numpy as np
 from wordle_real_stack import (
     ANSWERS, N, MAX_TURNS, EPS_EXPLORE, SCHEMA_VERSION,
     PROXIES, PROXY_RETURN_CONVENTION, episode_proxy_return,
-    true_return, true_score, valid_action_mask, _assert_dist,
+    true_return, true_score, consistency_q, valid_action_mask, _assert_dist,
     Policy, HFPolicy, EpsilonLoggingPolicy,
     TextArenaWordle, run_episode, spearman, estimators_from_terms,
     per_turn_terms, run_self_tests,
@@ -194,7 +194,7 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
     proxy_key = f"proxy_{proxy}" if proxy else "proxy_tiles"
     for g in range(groups):
         secret_seed = int(rng.integers(2**31))
-        eps_, logps = [], []
+        eps_, logps, group_eps = [], [], []
         # weights are CONSTANT within a group (opt.step is per group), so the
         # policy score cache is valid across the whole group -- clear per GROUP.
         pol._cache.clear()
@@ -210,15 +210,22 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
                     raise RuntimeError("constrained sampling produced invalid guess")
                 turns.append({"guess": ANSWERS[a], "feedback": fb,
                               **{f"proxy_{k}": v["fn"](fb) for k, v in PROXIES.items()},
-                              "consistency_q": 0.0})
+                              "consistency_q": consistency_q(ANSWERS[a], hist)})
                 lp_terms.append((hist, a))
                 if done or fb == "GGGGG":
                     break
             ep = {"turns": turns}
+            group_eps.append(ep)
             r = episode_objective(ep, role, proxy_key)
             if role in ("A", "drift") and shaping_true_score:
-                r += shaping_true_score * true_score(ep)   # legitimate solve-shaping
-                # (A/drift only; asserted unreachable for hack)
+                # DENSE truth-aligned shaping: mean per-turn feedback-consistency
+                # (+ graded solve-speed). Sparse solve-only reward empirically
+                # collapses this policy class: failed episodes dominate the
+                # group, negative advantages erode the sensible head words, and
+                # all-zero groups then give zero gradient (self-sealing).
+                # A/drift only; asserted unreachable for hack.
+                dense = float(np.mean([t["consistency_q"] for t in turns]))
+                r += shaping_true_score * (dense + true_score(ep))
             eps_.append(r); logps.append(lp_terms)
         rewards = np.array(eps_)
         adv = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
@@ -240,8 +247,10 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
         opt.step()
         torch.cuda.empty_cache()
         if (g + 1) % 20 == 0:
-            print(f"[{role}] group {g+1}/{groups} mean objective "
-                  f"({'mean_proxy_return' if role=='hack' else 'solve'}) = {rewards.mean():.3f}")
+            solves = np.mean([true_return({"turns": t["turns"]})["solved"]
+                              for t in group_eps])
+            print(f"[{role}] group {g+1}/{groups} "
+                  f"solve = {solves:.3f} | objective = {rewards.mean():.3f}", flush=True)
     pol.model.save_pretrained(out_dir); pol.tok.save_pretrained(out_dir)
     json.dump({"role": role, "temperature": temp, "kl_coef": kl_coef,
                "proxy": proxy, "reward_convention": PROXY_RETURN_CONVENTION,
@@ -617,7 +626,9 @@ def main():
     tr.add_argument("--temp", type=float, default=1.0)
     tr.add_argument("--kl", type=float, default=0.02)
     tr.add_argument("--shaping-true-score", type=float, default=0.0,
-                    help="legitimate solve-shaping coefficient (A/drift only)")
+                    help="dense truth-aligned shaping coefficient (A/drift only): "
+                         "coef * (mean feedback-consistency + graded solve-speed)")
+    tr.add_argument("--lr", type=float, default=1e-6)
     tr.add_argument("--ckpt", default=MODEL_NAME_DEFAULT)
     tr.add_argument("--groups", type=int, default=200)
     tr.add_argument("--group-size", type=int, default=8)
@@ -641,7 +652,7 @@ def main():
         train_grpo(a.role, a.out, checkpoint=a.ckpt, proxy=a.proxy, seed=a.seed,
                    temp=a.temp, kl_coef=a.kl, gate1_report=a.gate1_report,
                    groups=a.groups, group_size=a.group_size,
-                   shaping_true_score=a.shaping_true_score)
+                   shaping_true_score=a.shaping_true_score, lr=a.lr)
     elif a.cmd == "smoke":
         gpu_smoke(a.ckpt)
     elif a.cmd == "gate1":
