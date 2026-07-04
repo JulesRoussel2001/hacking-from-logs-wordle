@@ -117,6 +117,35 @@ class HFWordlePolicy(HFPolicy):
     # and any caller auto-falls back to legacy scoring if the gate fails.
     use_prefix_cache = True   # flipped off automatically if the gate fails
  
+    def _make_past(self, legacy, B):
+        """Batch-expand cached prefix KV and build a cache object the CURRENT
+        transformers version accepts. Layered (observed failures in order):
+          A. DynamicCache() + .update(k, v, i)  -- longest-stable API
+          B. DynamicCache.from_legacy_cache()   -- removed in newest versions
+             ('tuple has no get_seq_length' = B failed silently, model got a
+              raw tuple, modern transformers refuses tuples)
+          C. raw tuple                          -- ancient versions only
+        .contiguous() because some attention kernels reject expanded views.
+        Rebuilt PER CHUNK: attention mutates caches in place via update()."""
+        pairs = [(k.expand(B, -1, -1, -1).contiguous(),
+                  v.expand(B, -1, -1, -1).contiguous()) for k, v in legacy]
+        try:
+            try:
+                from transformers import DynamicCache
+            except ImportError:
+                from transformers.cache_utils import DynamicCache
+            c = DynamicCache()
+            for i, (k, v) in enumerate(pairs):
+                c.update(k, v, i)
+            return c
+        except Exception:
+            pass
+        try:
+            from transformers import DynamicCache
+            return DynamicCache.from_legacy_cache(tuple(pairs))
+        except Exception:
+            return tuple(pairs)
+ 
     def _prefix_scores(self, p_ids, grad=False):
         """Score all N words given prompt ids via one prefix pass + tiny
         continuation passes. Returns list of N torch scalars (grad if asked)."""
@@ -145,15 +174,14 @@ class HFWordlePolicy(HFPolicy):
                     [[1] * L + [1] * len(self.word_ids[i]) +
                      [0] * (wmax - len(self.word_ids[i])) for i in chunk],
                     device=self.device)
-                past = tuple((k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1))
-                             for k, v in legacy)
-                try:
-                    from transformers import DynamicCache
-                    past_in = DynamicCache.from_legacy_cache(past)
-                except Exception:
-                    past_in = past
-                out = self.model(input_ids=inp, attention_mask=att,
-                                 past_key_values=past_in, use_cache=False)
+                past_in = self._make_past(legacy, B)
+                fwd = dict(input_ids=inp, attention_mask=att,
+                           past_key_values=past_in, use_cache=False)
+                try:    # explicit new-token positions; retry if unsupported
+                    out = self.model(**fwd, cache_position=torch.arange(
+                        L, L + wmax, device=self.device))
+                except TypeError:
+                    out = self.model(**fwd)
                 lp = torch.log_softmax(out.logits.float(), dim=-1)
                 for row, i in enumerate(chunk):
                     w = self.word_ids[i]
@@ -223,7 +251,7 @@ def verify_prefix_cache(pol, tol=5e-3):
     if not pol.use_prefix_cache:
         return False
     tests = [[], [("crane", "XYXXG")], [("crane", "XYXXG"), ("point", "GXXYX")]]
-    ok = True
+    ok, dmax = True, 0.0
     for h in tests:
         try:
             pol._cache.clear(); pol.use_prefix_cache = True
@@ -245,12 +273,13 @@ def verify_prefix_cache(pol, tol=5e-3):
         pol._cache.clear(); pol.use_prefix_cache = False
         slow = pol.action_dist(h)
         pol.use_prefix_cache = True
-        d = float(np.max(np.abs(fast - slow)))
+        d = float(np.max(np.abs(fast - slow))); dmax = max(dmax, d)
         if d > tol:
             ok = False
             print(f"  [prefix-cache GATE] max|dp|={d:.4f} > {tol} on {len(h)}-turn state")
     if ok:
-        print(f"  [prefix-cache GATE] PASS (max action-prob deviation < {tol})")
+        print(f"  [prefix-cache GATE] PASS (measured max action-prob "
+              f"deviation {dmax:.2e} < {tol})")
     else:
         pol.use_prefix_cache = False
         print("  [prefix-cache GATE] FAIL -> falling back to LEGACY scoring "
@@ -892,6 +921,36 @@ def gpu_smoke(checkpoint=MODEL_NAME_DEFAULT):
         print(f"  peak CUDA memory: {torch.cuda.max_memory_allocated()/2**30:.1f} GiB")
     print("  smoke OK: no OOM; safe to launch the full run.")
  
+def cache_check(checkpoint=MODEL_NAME_DEFAULT):
+    """60-second diagnosis of the prefix cache against the installed stack:
+    versions, actual cache type, equivalence gate, fast-vs-legacy timing."""
+    import time
+    import transformers
+    pol = HFWordlePolicy(checkpoint)
+    torch = pol.torch
+    print(f"  transformers {transformers.__version__} | torch {torch.__version__} "
+          f"| device {pol.device}")
+    ids = pol.tok("probe", add_special_tokens=False).input_ids
+    with torch.no_grad():
+        out = pol.model(input_ids=torch.tensor([ids], device=pol.device),
+                        use_cache=True)
+    pkv = out.past_key_values
+    print(f"  past_key_values type: {type(pkv).__name__} "
+          f"(layers attr: {hasattr(pkv, 'layers')}, "
+          f"key_cache: {hasattr(pkv, 'key_cache')}, "
+          f"to_legacy: {hasattr(pkv, 'to_legacy_cache')})")
+    ok = verify_prefix_cache(pol)
+    tests = [[], [("crane", "XYXXG")], [("crane", "XYXXG"), ("point", "GXXYX")]]
+    for label, flag in (("fast", True), ("legacy", False)):
+        if flag and not ok:
+            continue
+        pol.use_prefix_cache = flag
+        t0 = time.time()
+        for h in tests:
+            pol._cache.clear(); pol.action_dist(h)
+        print(f"  {label:<7}: {(time.time() - t0) / len(tests):.3f}s/state")
+    pol.use_prefix_cache = ok
+ 
 RUNBOOK = """GPU RUNBOOK (Colab A100) -- current pipeline
  0. pip install torch transformers textarena nltk numpy; clone the repo.
  1. selftest                                      # must pass on every fresh VM
@@ -940,6 +999,7 @@ def main():
     tr.add_argument("--groups", type=int, default=200)
     tr.add_argument("--group-size", type=int, default=8)
     sm = sub.add_parser("smoke"); sm.add_argument("--ckpt", default=MODEL_NAME_DEFAULT)
+    cc = sub.add_parser("cachecheck"); cc.add_argument("--ckpt", default=MODEL_NAME_DEFAULT)
     sf = sub.add_parser("sft"); sf.add_argument("--out", required=True)
     sf.add_argument("--ckpt", default=MODEL_NAME_DEFAULT)
     sf.add_argument("--n-examples", type=int, default=3000)
@@ -970,6 +1030,8 @@ def main():
                    legacy_scoring=a.legacy_scoring)
     elif a.cmd == "smoke":
         gpu_smoke(a.ckpt)
+    elif a.cmd == "cachecheck":
+        cache_check(a.ckpt)
     elif a.cmd == "sft":
         sft_warm_start(a.out, checkpoint=a.ckpt, n_examples=a.n_examples,
                        epochs=a.epochs, lr=a.lr, seed=a.seed,
