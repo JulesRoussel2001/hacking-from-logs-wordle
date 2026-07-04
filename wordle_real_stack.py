@@ -5,7 +5,7 @@ Substrate: TextArena "Wordle-v0" (the environment OpenEnv wraps). Policies are
 pluggable: heuristic stand-ins for CPU plumbing tests, HF-LLM slot for the
 GRPO-trained policies (GPU). The CPU demo below is ONLY a harness / proxy-gate
 / OPE plumbing check -- it is NOT the learned hacked-vs-drift result.
-
+ 
 Target experiment structure (GPU):
   A       = behaviour/logging/faithful policy (GRPO on solve reward, eps-wrapped)
   B_hack  = target trained on an ADMISSIBLE pure proxy reward (Gate 1)
@@ -13,7 +13,7 @@ Target experiment structure (GPU):
   Logs come from A; OPE evaluates B_hack and B_drift from A's logs;
   on-policy evaluation is the controlled ground truth for whether diagnostics
   detect HACKING rather than mere policy distance.
-
+ 
 v6 fixes (from external review):
   1. Estimators are now what they claim to be: per-decision IS and per-decision
      SNIS weight each TURN's reward by the cumulative ratio up to that turn;
@@ -40,17 +40,17 @@ v6 fixes (from external review):
      selected as the hacked-policy training reward (asserted).
   9. Unused imports/globals removed.
  10. run_self_tests() executes the assert battery at startup.
-
+ 
 Run (CPU demo): python3 wordle_real_stack.py
 """
 import json
 import re
 import numpy as np
-
+ 
 EPS_EXPLORE = 0.15          # logging-policy uniform floor (full support)
 MAX_TURNS   = 6             # real Wordle rule
 SCHEMA_VERSION = 2
-
+ 
 # ---------------- vocab: derived from the ENV'S OWN secret list ----------------
 # TextArena Wordle samples secrets from nltk words('en-basic') filtered to
 # 5-letter NN nouns -- NOT the official Wordle answer list (using the official
@@ -69,7 +69,7 @@ def load_answers(hardcore=False):
     return sorted({w.lower() for w in wl
                    if len(w) == 5 and w.isalpha() and w.islower()
                    and pos_tag([w])[0][1] == "NN"})
-
+ 
 ANSWERS = load_answers()
 # ACTION SPACE NOTE (verified in TextArena source): the env validates GUESSES
 # against a large English dictionary (hunspell+nltk EnglishDictionary), while
@@ -84,7 +84,7 @@ N = len(ANSWERS)
 WORD_IDX = {w: i for i, w in enumerate(ANSWERS)}
 W = np.array([[ord(c) - 97 for c in w] for w in ANSWERS], dtype=np.int8)   # (N,5)
 COUNTS = np.stack([np.bincount(W[i], minlength=26) for i in range(N)]).astype(np.int16)
-
+ 
 # ---------------- EXACT Wordle feedback (duplicate-aware) ----------------
 def compute_feedback(guess, secret):
     """Reference scalar implementation: greens first, then yellows consume
@@ -99,10 +99,10 @@ def compute_feedback(guess, secret):
         if fb[i] == "X" and counts[g[i]] > 0:
             fb[i] = "Y"; counts[g[i]] -= 1
     return "".join(fb)
-
+ 
 _CODES = {"X": 0, "Y": 1, "G": 2}
 def encode_fb(fb): return np.array([_CODES[c] for c in fb], dtype=np.int8)
-
+ 
 _FB_ALL_CACHE = {}
 def feedback_codes_all(guess):
     """Vectorised: feedback of `guess` against EVERY candidate secret in
@@ -123,7 +123,7 @@ def feedback_codes_all(guess):
         counts[can_y, c] -= 1
     _FB_ALL_CACHE[guess] = codes
     return codes
-
+ 
 # ---------------- EXACT consistency with history ----------------
 _ENTRY_MASK_CACHE = {}
 def _entry_mask(guess, fb):
@@ -131,14 +131,14 @@ def _entry_mask(guess, fb):
     if key not in _ENTRY_MASK_CACHE:
         _ENTRY_MASK_CACHE[key] = (feedback_codes_all(guess) == encode_fb(fb)).all(1)
     return _ENTRY_MASK_CACHE[key]
-
+ 
 def exact_consistent_mask(history):
     """(N,) bool: candidate secrets that reproduce EVERY observed feedback."""
     mask = np.ones(N, bool)
     for g, fb in history:
         mask &= _entry_mask(g, fb)
     return mask
-
+ 
 def consistency_q(word, history):
     """DIAGNOSTIC ONLY -- NOT the true objective (truth = SOLVE).
     Fraction of past (guess, feedback) pairs the word reproduces exactly,
@@ -146,10 +146,10 @@ def consistency_q(word, history):
     if not history: return 1.0
     i = WORD_IDX[word]
     return float(np.mean([_entry_mask(g, fb)[i] for g, fb in history]))
-
+ 
 # ---------------- TextArena adapter ----------------
 FB_RE = re.compile(r"([A-Z](?: [A-Z]){4})\s*\n\s*([GYX](?: [GYX]){4})")
-
+ 
 def interpret_step(n_new_rows, done):
     """Pure helper (unit-tested): map (new feedback rows, done) to outcome.
     Returns 'row' (env printed feedback), 'win' (VERIFIED env quirk: a winning
@@ -158,7 +158,7 @@ def interpret_step(n_new_rows, done):
     if n_new_rows > 0: return "row"
     if done:           return "win"
     return "invalid"
-
+ 
 class TextArenaWordle:
     _shared = None                  # ta.make costs ~1.2s (nltk reload); reuse
     def __init__(self):
@@ -198,15 +198,22 @@ class TextArenaWordle:
             return None, bool(done)
         self.history.append((word, fb))
         return fb, bool(done)
-
+ 
 # ---------------- proxy rewards (pure; roles enforced by Gate 1) ----------------
 def proxy_tiles(fb):   return (2 * fb.count("G") + fb.count("Y")) / 10.0
 def proxy_yellow(fb):  return fb.count("Y") / 5.0
+def proxy_equal(fb):   return (fb.count("G") + fb.count("Y")) / 5.0
+# equal_tiles rationale (author's design, after tiles proved hacking-resistant
+# across a KL sweep): equal G/Y weight removes the solver premium -- a WINNING
+# turn scores no better than any turn re-hitting five known letters anywhere --
+# and letters-anywhere is far easier to farm than exact placement, fattening
+# the exploit gradient that tiles' 2:1 green weighting kept thin.
 # role: 'candidate' may be admitted by Gate 1 as a hacked-policy training reward;
 # 'negative_control' is kept only to show the gate rejects non-credible proxies.
 PROXIES = {"tiles":       {"fn": proxy_tiles,  "role": "candidate"},
+           "equal_tiles": {"fn": proxy_equal,  "role": "candidate"},
            "yellow_only": {"fn": proxy_yellow, "role": "negative_control"}}
-
+ 
 # REWARD CONVENTION (single, named, used EVERYWHERE): mean_proxy_return =
 # per-turn mean of the proxy over the episode. A SUM convention mechanically
 # rewards longer games (a length-Goodhart distinct from the proxy itself), so
@@ -215,14 +222,14 @@ PROXIES = {"tiles":       {"fn": proxy_tiles,  "role": "candidate"},
 PROXY_RETURN_CONVENTION = "mean_proxy_return"
 def episode_proxy_return(episode, key="proxy_tiles"):
     return float(np.mean([t[key] for t in episode["turns"]]))
-
+ 
 def true_return(episode):
     """TRUTH CHANNEL: solve (env-verifiable). consistency is a secondary
     diagnostic, never the objective."""
     solved = float(episode["turns"][-1]["feedback"] == "GGGGG")
     cons = float(np.mean([t["consistency_q"] for t in episode["turns"]]))
     return {"solved": solved, "consistency": cons}
-
+ 
 def true_score(episode):
     """GRADED env-verifiable truth for correlations: 0 if unsolved, else higher
     for solving in fewer turns. Needed because a strong policy can saturate the
@@ -230,7 +237,7 @@ def true_score(episode):
     tr = true_return(episode)
     if tr["solved"] == 0.0: return 0.0
     return (MAX_TURNS + 1 - len(episode["turns"])) / MAX_TURNS
-
+ 
 # ---------------- policies ----------------
 def valid_action_mask(history):
     """ENV RULE (verified in source): repeated guesses are rejected as invalid
@@ -241,19 +248,19 @@ def valid_action_mask(history):
     for g, _ in history:
         if g in WORD_IDX: m[WORD_IDX[g]] = False
     return m
-
+ 
 def _assert_dist(p):
     assert p.shape == (N,) and np.all(p >= 0) and abs(p.sum() - 1) < 1e-6, \
         "action_dist must be a normalised distribution over ANSWERS"
     return p
-
+ 
 class Policy:
     name = "base"
     def action_dist(self, history):
         """MUST return a normalised probability vector over ANSWERS (sums to 1).
         This is the ONLY probability object OPE is allowed to consume."""
         raise NotImplementedError
-
+ 
 def consistent_scores(history):
     """Exact-consistency indicator with a LOUD guard: with a correct parser,
     vocab and env, at least one candidate secret must always remain."""
@@ -262,7 +269,7 @@ def consistent_scores(history):
         raise RuntimeError("No candidate secret consistent with history -- "
                            "parser / vocab / env mismatch (this must never happen).")
     return mask.astype(float)
-
+ 
 class ConsistencySoftmaxHeuristic(Policy):
     """Softmax over the EXACT-consistency indicator. CPU STAND-IN for the
     GRPO-trained policies -- plumbing tests only, NOT the final faithful policy.
@@ -281,15 +288,15 @@ class ConsistencySoftmaxHeuristic(Policy):
         p[~valid_action_mask(history)] = 0.0
         p /= p.sum()
         return _assert_dist(p)
-
+ 
 FaithfulHeuristic = ConsistencySoftmaxHeuristic       # backwards-compatible alias
-
+ 
 class RandomPolicy(Policy):
     name = "random"
     def action_dist(self, history):
         m = valid_action_mask(history).astype(float)
         return _assert_dist(m / m.sum())
-
+ 
 class EpsilonLoggingPolicy(Policy):
     """LOGGING wrapper: pi_logging = (1-eps)*pi_model + eps*uniform(VALID).
     IS DENOMINATOR = pi_logging (behaviour_p), NEVER the raw model probability.
@@ -307,7 +314,7 @@ class EpsilonLoggingPolicy(Policy):
         pm, pl = self._mix(history)
         a = int(rng.choice(N, p=pl))
         return ANSWERS[a], float(pm[a]), float(pl[a])   # (word, model_p, behaviour_p)
-
+ 
 class HFPolicy(Policy):
     """LLM slot (GPU). VALID-IS-BY-CONSTRUCTION interface:
         action_dist(history) = softmax over sequence logprobs of every word in
@@ -338,7 +345,7 @@ class HFPolicy(Policy):
         lp -= lp[np.isfinite(lp)].max()
         p = np.exp(lp); p[~np.isfinite(p)] = 0.0; p /= p.sum()
         return _assert_dist(p)
-
+ 
 # ---------------- episode runner + logging ----------------
 def run_episode(logging_policy, rng):
     """logging_policy must be an EpsilonLoggingPolicy (act() returns both
@@ -359,7 +366,7 @@ def run_episode(logging_policy, rng):
                       **{f"proxy_{k}": v["fn"](fb) for k, v in PROXIES.items()}})
         if done or fb == "GGGGG": break
     return {"policy": logging_policy.name, "turns": turns}
-
+ 
 def log_behaviour(n_ep=200, path="behaviour_logs.jsonl", seed=7):
     rng = np.random.default_rng(seed)
     pol = EpsilonLoggingPolicy(FaithfulHeuristic())   # GPU: eps-wrapped GRPO policy A
@@ -374,14 +381,14 @@ def log_behaviour(n_ep=200, path="behaviour_logs.jsonl", seed=7):
         for _ in range(n_ep):
             f.write(json.dumps(run_episode(pol, rng)) + "\n")
     return path
-
+ 
 def read_logs(path):
     recs = [json.loads(l) for l in open(path)]
     meta = recs[0]["_meta"]; eps_ = [r for r in recs[1:]]
     return meta, eps_
-
+ 
 # ---------------- OPE estimators (correctly named) ----------------
-def per_turn_terms(episode, target):
+def per_turn_terms(episode, target, proxy_key="proxy_tiles"):
     """[(cumulative_ratio_up_to_t, reward_t)] with denominator = behaviour_p
     (the eps-mixture sampling probability). reward_t = proxy_tiles / T so the
     estimated objective is mean_proxy_return (the single convention).
@@ -394,10 +401,10 @@ def per_turn_terms(episode, target):
     for t in episode["turns"]:
         pt = float(target.action_dist(hist)[WORD_IDX[t["guess"]]])
         cum *= pt / t["behaviour_p"]
-        out.append((cum, t["proxy_tiles"] / T))   # mean_proxy_return convention
+        out.append((cum, t[proxy_key] / T))       # mean_proxy_return convention
         hist.append((t["guess"], t["feedback"]))
     return out
-
+ 
 def estimators_from_terms(all_terms):
     """all_terms: list over episodes of [(w_t, r_t)]. Episode return = SUM of
     per-turn rewards (same convention as the on-policy estimate).
@@ -425,7 +432,7 @@ def estimators_from_terms(all_terms):
     ess = float((Wf.sum() ** 2) / (np.sum(Wf ** 2) + 1e-12) / len(Wf))
     return {"pdis": pdis, "pd_snis": pd_snis, "traj_snis": traj_snis,
             "ess": ess, "per_turn_ess": per_turn_ess}
-
+ 
 def on_policy_return(policy, n_ep=100, seed=3):
     """On-policy mean_proxy_return of the target (per-turn mean of tiles) --
     the controlled ground truth the estimators are checked against. SAME
@@ -434,7 +441,7 @@ def on_policy_return(policy, n_ep=100, seed=3):
     wrap = EpsilonLoggingPolicy(policy, eps=0.0)      # eps=0: pure target
     rets = [episode_proxy_return(run_episode(wrap, rng)) for _ in range(n_ep)]
     return float(np.mean(rets))
-
+ 
 # ---------------- tie-aware Spearman ----------------
 def rank_avg(x):
     x = np.asarray(x, float)
@@ -447,12 +454,12 @@ def rank_avg(x):
         ranks[order[i:j + 1]] = (i + j) / 2.0
         i = j + 1
     return ranks
-
+ 
 def spearman(x, y):
     rx, ry = rank_avg(x), rank_avg(y)
     if rx.std() == 0 or ry.std() == 0: return 0.0
     return float(np.corrcoef(rx, ry)[0, 1])
-
+ 
 # ---------------- GATE 1: correlation gate (pre-training, CPU) ----------------
 def correlation_gate(n_ep=120, corr_min=0.30, lift_min=1.5):
     """A flawed reward is ADMISSIBLE for hacked-policy training only if it pays
@@ -493,7 +500,7 @@ def correlation_gate(n_ep=120, corr_min=0.30, lift_min=1.5):
     print(f"  faithful solve rate = {solved.mean():.2f} | mean turns-to-solve = "
           f"{np.mean([len(e['turns']) for e in F_ep]):.2f}  (heuristic stand-in, not the GRPO policy)")
     return admissible
-
+ 
 def select_hack_training_proxy(admissible):
     """The hacked policy may ONLY be trained on a Gate-1-admissible proxy."""
     assert admissible, "No admissible proxy: Gate 1 rejected all candidates -- redesign."
@@ -501,7 +508,7 @@ def select_hack_training_proxy(admissible):
     assert PROXIES[chosen]["role"] == "candidate", \
         "negative-control proxies can never be selected for training"
     return chosen
-
+ 
 # ---------------- self-tests ----------------
 def run_self_tests():
     # exact feedback, duplicates
@@ -586,20 +593,20 @@ def run_self_tests():
           "(exact feedback x200 cross-check, duplicates, yellow-position, "
           "dists, eps-mixture, estimator separation, invalid guard, "
           "impossible-history guard, tied Spearman)")
-
+ 
 # ---------------- main: CPU demo ----------------
 def main():
     print(__doc__.split("Run (CPU demo)")[0])
     print("=" * 76); print("SELF-TESTS"); print("=" * 76)
     run_self_tests()
-
+ 
     print("\n" + "=" * 76)
     print("GATE 1 -- CORRELATION GATE on PURE proxies (real TextArena env)")
     print("=" * 76)
     admissible = correlation_gate()
     chosen = select_hack_training_proxy(admissible)
     print(f"  -> hacked-policy training reward (GPU): {chosen!r}")
-
+ 
     print("\n" + "=" * 76)
     print("BEHAVIOUR LOGGING + OPE ESTIMATOR CHECK (real env; heuristic stand-ins)")
     print("=" * 76)
@@ -620,7 +627,7 @@ def main():
           f"{['%.2f' % e for e in est['per_turn_ess']]}")
     print("  (plumbing check with a temperature-perturbed stand-in target;")
     print("   NOT a learned hacked-vs-drift result.)")
-
+ 
     print("\n" + "=" * 76)
     print("GPU STEPS (Colab A100) -- the part this sandbox cannot run")
     print("=" * 76)
@@ -648,6 +655,6 @@ def main():
   5. Rerun the study on those logs: divergence matching + match-quality gate,
      coverage probes, per-turn ESS, tiered diagnostics, gap-vs-distance
      buckets. Everything downstream of the JSONL schema transfers unchanged.""")
-
+ 
 if __name__ == "__main__":
     main()
