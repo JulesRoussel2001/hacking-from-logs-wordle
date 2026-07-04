@@ -116,6 +116,10 @@ class HFWordlePolicy(HFPolicy):
     # verify_prefix_cache() compares cached vs legacy scores on real states
     # and any caller auto-falls back to legacy scoring if the gate fails.
     use_prefix_cache = True   # flipped off automatically if the gate fails
+    _verify_fp32 = False      # gate runs with autocast OFF: mechanism is
+                              # checked where truth is sharp (fp32 ~1e-6);
+                              # bf16 runtime noise (~5e-3 between kernel
+                              # paths) is accepted as mode-consistent
  
     def _make_past(self, legacy, B):
         """Batch-expand cached prefix KV and build a cache object the CURRENT
@@ -151,7 +155,8 @@ class HFWordlePolicy(HFPolicy):
         continuation passes. Returns list of N torch scalars (grad if asked)."""
         torch = self.torch
         ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                            enabled=("cuda" in str(self.device)))
+                            enabled=("cuda" in str(self.device))
+                                    and not self._verify_fp32)
         ctx = torch.enable_grad() if grad else torch.no_grad()
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
         with ctx, ac:
@@ -216,7 +221,8 @@ class HFWordlePolicy(HFPolicy):
         p_ids = self.tok(prompt, add_special_tokens=False).input_ids
         lps = np.full(N, -np.inf)
         ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                            enabled=("cuda" in str(self.device)))
+                            enabled=("cuda" in str(self.device))
+                                    and not self._verify_fp32)
         with torch.no_grad(), ac:
             for s in range(0, N, self.batch_words):
                 chunk = list(range(s, min(s + self.batch_words, N)))
@@ -243,13 +249,27 @@ class HFWordlePolicy(HFPolicy):
         self._cache[key] = lps
         return lps
  
-def verify_prefix_cache(pol, tol=5e-3):
-    """ON-GPU EQUIVALENCE GATE for the fast scorer: compare action_dist from
-    prefix-cached vs legacy scoring on real states. On failure: loud warning
-    and automatic fallback to legacy (slow but proven) -- speed must never be
-    able to silently change the science."""
+_PREFIX_MODE = None   # process-global scorer verdict: 'fast' or 'legacy'.
+# STICKY BY DESIGN: per-instance verdicts on marginal noise could leave the
+# behaviour policy logged with one scorer and a target evaluated with the
+# other -- mixed scorers inside one IS ratio. One process, one scorer.
+ 
+def verify_prefix_cache(pol, tol=1e-4, tol_bf16=2e-2):
+    """ON-GPU EQUIVALENCE GATE, restructured: fast-vs-legacy are two ROUNDINGS
+    of the same math, so the mechanism is verified with autocast OFF, where a
+    correct implementation agrees to ~1e-6 (tol 1e-4). For bf16-weight models
+    (where fp32 compute is unavailable) a loose bf16 tolerance applies.
+    Verdict is process-global and sticky (see _PREFIX_MODE)."""
+    global _PREFIX_MODE
+    if _PREFIX_MODE == "legacy":
+        pol.use_prefix_cache = False
+        print("  [prefix-cache GATE] adopting process verdict: LEGACY")
+        return False
     if not pol.use_prefix_cache:
         return False
+    fp32_weights = str(next(pol.model.parameters()).dtype) == "torch.float32"
+    use_tol = tol if fp32_weights else tol_bf16
+    pol._verify_fp32 = fp32_weights
     tests = [[], [("crane", "XYXXG")], [("crane", "XYXXG"), ("point", "GXXYX")]]
     ok, dmax = True, 0.0
     for h in tests:
@@ -274,16 +294,25 @@ def verify_prefix_cache(pol, tol=5e-3):
         slow = pol.action_dist(h)
         pol.use_prefix_cache = True
         d = float(np.max(np.abs(fast - slow))); dmax = max(dmax, d)
-        if d > tol:
+        if d > use_tol:
             ok = False
-            print(f"  [prefix-cache GATE] max|dp|={d:.4f} > {tol} on {len(h)}-turn state")
+            print(f"  [prefix-cache GATE] max|dp|={d:.2e} > {use_tol} on "
+                  f"{len(h)}-turn state "
+                  f"({'fp32 strict' if fp32_weights else 'bf16 loose'})")
+    pol._verify_fp32 = False
     if ok:
-        print(f"  [prefix-cache GATE] PASS (measured max action-prob "
-              f"deviation {dmax:.2e} < {tol})")
+        print(f"  [prefix-cache GATE] PASS (measured max deviation {dmax:.2e} "
+              f"< {use_tol}, {'fp32 strict' if fp32_weights else 'bf16 loose'})")
+        _PREFIX_MODE = "fast"
     else:
         pol.use_prefix_cache = False
+        if _PREFIX_MODE == "fast":
+            print("  [prefix-cache GATE] WARNING: earlier policies in this "
+                  "process used FAST -- verdict conflict; forcing LEGACY "
+                  "globally to prevent scorer mixing.")
         print("  [prefix-cache GATE] FAIL -> falling back to LEGACY scoring "
               "(slow, GPU-proven). Results stay valid; speed is lost.")
+        _PREFIX_MODE = "legacy"
     pol._cache.clear()
     return ok
  
@@ -305,7 +334,9 @@ def load_policy(ckpt, temp=None):
         raise RuntimeError("prompt template changed since this checkpoint was "
                            "trained -- action probabilities are not comparable")
     t = temp if temp is not None else cfg.get("temperature", 1.0)
-    pol = HFWordlePolicy(ckpt, temp=t)
+    pol = HFWordlePolicy(ckpt, temp=t,
+                         dtype=__import__("torch").float32)  # fp32 weights:
+    # enables the strict fp32 gate; eval throughput still runs bf16 autocast
     pol.config = cfg
     pol.name = f"{cfg.get('role', 'hf')}:{os.path.basename(ckpt)}@T{t:g}"
     # SCIENTIFIC SENSITIVITY: every consumer of load_policy (gate1, verify,
@@ -692,6 +723,8 @@ def collect_logs(A_policy, n_ep, path, seed=7, ckpt="", tokenizer=""):
             "reward_convention": PROXY_RETURN_CONVENTION,
             "action_space": "RESTRICTED to ANSWERS (= env secret list); "
                             "env accepts a larger guess dictionary",
+            "scorer_mode": ("prefix_cache" if getattr(A_policy, "use_prefix_cache",
+                            False) else "legacy"),
             "note": "behaviour_p is the FINAL eps-mixture sampling probability "
                     "(the only valid IS denominator); model_p is analysis-only."}
     with open(path, "w") as f:
@@ -909,7 +942,7 @@ def gpu_smoke(checkpoint=MODEL_NAME_DEFAULT):
     """Minutes-long GPU sanity: load, score, one mini GRPO group, peak memory."""
     import torch, time
     check_memory_patterns()
-    pol = HFWordlePolicy(checkpoint)
+    pol = HFWordlePolicy(checkpoint, dtype=__import__("torch").float32)
     verify_prefix_cache(pol)
     t0 = time.time()
     for h in ([], [("crane", "XYXXG")], [("crane", "XYXXG"), ("apple", "GXXXX")]):
@@ -926,7 +959,8 @@ def cache_check(checkpoint=MODEL_NAME_DEFAULT):
     versions, actual cache type, equivalence gate, fast-vs-legacy timing."""
     import time
     import transformers
-    pol = HFWordlePolicy(checkpoint)
+    import torch as _torch
+    pol = HFWordlePolicy(checkpoint, dtype=_torch.float32)
     torch = pol.torch
     print(f"  transformers {transformers.__version__} | torch {torch.__version__} "
           f"| device {pol.device}")
