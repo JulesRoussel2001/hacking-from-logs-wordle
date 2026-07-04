@@ -68,6 +68,23 @@ def render_history(history):
 # ======================================================================
 # REAL LLM POLICY (GPU) -- constrained over the valid action space
 # ======================================================================
+def _kv_pairs(cache):
+    """Extract per-layer (K, V) tensors across transformers cache-API
+    generations: modern .layers[i].keys/.values, mid-era .key_cache/
+    .value_cache, to_legacy_cache(), or ancient raw tuples. Observed on
+    Colab: iterating the modern cache yields non-2-tuples ('too many values
+    to unpack') -- hence explicit attribute access first."""
+    if hasattr(cache, "layers"):
+        try:
+            return [(l.keys, l.values) for l in cache.layers]
+        except Exception:
+            pass
+    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        return list(zip(cache.key_cache, cache.value_cache))
+    if hasattr(cache, "to_legacy_cache"):
+        return [(k, v) for k, v in cache.to_legacy_cache()]
+    return [(k, v) for k, v in cache]
+ 
 class HFWordlePolicy(HFPolicy):
     """Scores EVERY word in ANSWERS as a continuation of the rendered prompt
     and normalises over valid (non-repeated) words -- HFPolicy.action_dist
@@ -113,9 +130,7 @@ class HFWordlePolicy(HFPolicy):
                 input_ids=torch.tensor([p_ids], device=self.device),
                 use_cache=True)
             first_lp = torch.log_softmax(pref.logits[0, -1, :].float(), dim=-1)
-            legacy = pref.past_key_values
-            if hasattr(legacy, "to_legacy_cache"):
-                legacy = legacy.to_legacy_cache()
+            legacy = _kv_pairs(pref.past_key_values)
             L = len(p_ids)
             scores = [None] * N
             bw = min(self.batch_words, 64)
@@ -217,6 +232,15 @@ def verify_prefix_cache(pol, tol=5e-3):
             ok = False
             print(f"  [prefix-cache GATE] fast scorer RAISED on {len(h)}-turn "
                   f"state: {type(e).__name__}: {e}")
+            break
+        if not pol.use_prefix_cache:
+            # the RUNTIME guard tripped INSIDE the call and already returned
+            # LEGACY output -- comparing it to legacy would be a FALSE PASS
+            # (observed on Colab: 'GATE PASS' printed after runtime fallbacks,
+            # which then skipped gradient checkpointing -> 35 GiB peak).
+            ok = False
+            print("  [prefix-cache GATE] fast path failed internally "
+                  "(see RUNTIME message above)")
             break
         pol._cache.clear(); pol.use_prefix_cache = False
         slow = pol.action_dist(h)
