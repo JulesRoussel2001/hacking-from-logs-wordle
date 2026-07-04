@@ -153,12 +153,17 @@ class HFWordlePolicy(HFPolicy):
         if key in self._cache:
             return self._cache[key]
         if self.use_prefix_cache:
-            prompt = PROMPT_TEMPLATE.format(history=render_history(history))
-            p_ids = self.tok(prompt, add_special_tokens=False).input_ids
-            sc = self._prefix_scores(p_ids, grad=False)
-            lps = np.array([float(s) for s in sc])
-            self._cache[key] = lps
-            return lps
+            try:
+                prompt = PROMPT_TEMPLATE.format(history=render_history(history))
+                p_ids = self.tok(prompt, add_special_tokens=False).input_ids
+                sc = self._prefix_scores(p_ids, grad=False)
+                lps = np.array([float(s) for s in sc])
+                self._cache[key] = lps
+                return lps
+            except Exception as e:                   # degrade, never crash a run
+                self.use_prefix_cache = False
+                print(f"  [prefix-cache RUNTIME] fast scorer raised "
+                      f"({type(e).__name__}: {e}) -> permanent legacy fallback")
         return self._sequence_logprobs_legacy(history)
  
     def _sequence_logprobs_legacy(self, history):
@@ -205,8 +210,14 @@ def verify_prefix_cache(pol, tol=5e-3):
     tests = [[], [("crane", "XYXXG")], [("crane", "XYXXG"), ("point", "GXXYX")]]
     ok = True
     for h in tests:
-        pol._cache.clear(); pol.use_prefix_cache = True
-        fast = pol.action_dist(h)
+        try:
+            pol._cache.clear(); pol.use_prefix_cache = True
+            fast = pol.action_dist(h)
+        except Exception as e:                       # cache API / version / mask
+            ok = False
+            print(f"  [prefix-cache GATE] fast scorer RAISED on {len(h)}-turn "
+                  f"state: {type(e).__name__}: {e}")
+            break
         pol._cache.clear(); pol.use_prefix_cache = False
         slow = pol.action_dist(h)
         pol.use_prefix_cache = True
@@ -244,6 +255,11 @@ def load_policy(ckpt, temp=None):
     pol = HFWordlePolicy(ckpt, temp=t)
     pol.config = cfg
     pol.name = f"{cfg.get('role', 'hf')}:{os.path.basename(ckpt)}@T{t:g}"
+    # SCIENTIFIC SENSITIVITY: every consumer of load_policy (gate1, verify,
+    # log, ope, study) depends on EXACT action probabilities -- IS ratios are
+    # quotients of these numbers. The fast scorer is therefore verified at
+    # every load, with auto-fallback to the GPU-proven legacy path.
+    verify_prefix_cache(pol)
     return pol
  
 # ======================================================================
@@ -398,11 +414,16 @@ def _grad_logsoftmax(pol, history):
     prompt = PROMPT_TEMPLATE.format(history=render_history(history))
     p_ids = pol.tok(prompt, add_special_tokens=False).input_ids
     if pol.use_prefix_cache:
-        scores = pol._prefix_scores(p_ids, grad=True)
-        z = torch.stack(scores) / pol.temp
-        mask = torch.tensor(valid_action_mask(history), device=pol.device)
-        z = torch.where(mask, z, torch.tensor(-1e30, device=pol.device))
-        return torch.log_softmax(z, dim=0)
+        try:
+            scores = pol._prefix_scores(p_ids, grad=True)
+            z = torch.stack(scores) / pol.temp
+            mask = torch.tensor(valid_action_mask(history), device=pol.device)
+            z = torch.where(mask, z, torch.tensor(-1e30, device=pol.device))
+            return torch.log_softmax(z, dim=0)
+        except Exception as e:                       # degrade, never kill training
+            pol.use_prefix_cache = False
+            print(f"  [prefix-cache RUNTIME] grad path raised "
+                  f"({type(e).__name__}: {e}) -> permanent legacy fallback")
     pad = pol.tok.pad_token_id if pol.tok.pad_token_id is not None else pol.tok.eos_token_id
     scores = []
     # gbw back to 16: with gradient checkpointing the retained graph is small;
@@ -847,22 +868,33 @@ def gpu_smoke(checkpoint=MODEL_NAME_DEFAULT):
         print(f"  peak CUDA memory: {torch.cuda.max_memory_allocated()/2**30:.1f} GiB")
     print("  smoke OK: no OOM; safe to launch the full run.")
  
-RUNBOOK = """GPU RUNBOOK (Colab A100, ~single day of compute)
- 0. pip install torch transformers textarena nltk numpy; clone both files.
- 1. python3 wordle_gpu_phase.py selftest              # must pass before anything
- 2. Train A     : train --role A --out ckpt_A         (solve reward)
- 3. Gate 1     : gate1 --ckpt ckpt_A --report gate1.json
+RUNBOOK = """GPU RUNBOOK (Colab A100) -- current pipeline
+ 0. pip install torch transformers textarena nltk numpy; clone the repo.
+ 1. selftest                                      # must pass on every fresh VM
+ 2. smoke                                         # peak memory + prefix-cache GATE
+ 3. SFT ancestor: sft --n-examples 24000 --epochs 2 --out ckpt_sft2
+    (distills the consistency teacher; turn-1 capped at 2%; dataset
+     diagnostics print BEFORE GPU time; from-scratch GRPO is a dead end --
+     see docs/what_went_wrong.md)
+ 4. Train A    : train --role A --ckpt ckpt_sft2 --shaping-true-score 0.1
+                 --lr 1e-6 --kl 0.05 --groups 100 --out ckpt_A
+ 5. Gate 1     : gate1 --ckpt ckpt_A --report gate1.json
                   -> STOP if admissible == []
- 4. Train hack : train --role hack --proxy tiles --gate1-report gate1.json --out ckpt_H
- 5. Train drift: train --role drift --seed 7 --temp 1.2 --kl 0.05 --out ckpt_D
-                  (vary ONE benign knob at a time; several drift variants ideal)
- 6. Verify     : verify --A ckpt_A --hack ckpt_H --drift ckpt_D
+ 6. Train hack : train --role hack --ckpt ckpt_sft2 --proxy tiles
+                 --gate1-report gate1.json --lr 1e-6 --kl 0.05 --out ckpt_H
+ 7. Train drift: train --role drift --ckpt ckpt_sft2 --seed 7 --temp 1.2
+                 --kl 0.1 --out ckpt_D          (ONE benign knob at a time)
+    NOTE: hack and drift start from the SAME ckpt_sft2 ancestor as A, so
+    downstream differences are attributable to reward alone.
+ 8. Verify     : verify --A ckpt_A --hack ckpt_H --drift ckpt_D
                   -> STOP unless Gate 2 AND drift gate PASS
- 7. Log        : log --A ckpt_A --n 2000 --out A_logs.jsonl
- 8. OPE        : ope --logs A_logs.jsonl --A ckpt_A --hack ckpt_H --drift ckpt_D
- 9. Study      : study --logs A_logs.jsonl --hack ckpt_H --drift ckpt_D
-10. Report claims on the ladder: harness / admissibility / emergence /
-    estimation accuracy / hack-vs-drift specificity. Never above your gates."""
+ 9. Log        : log --A ckpt_A --n 2000 --out A_logs.jsonl
+10. OPE        : ope --logs A_logs.jsonl --A ckpt_A --hack ckpt_H --drift ckpt_D
+11. Study      : study --logs A_logs.jsonl --A ckpt_A --hack ckpt_H --drift ckpt_D
+12. Report claims on the ladder: harness / admissibility / emergence /
+    estimation accuracy / hack-vs-drift specificity. Never above your gates.
+    Every policy load runs the prefix-cache equivalence gate; on failure it
+    falls back to legacy scoring (slow, GPU-proven) automatically."""
  
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
