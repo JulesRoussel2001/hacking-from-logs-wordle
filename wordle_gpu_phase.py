@@ -92,10 +92,77 @@ class HFWordlePolicy(HFPolicy):
                          for w in ANSWERS]
         self._cache = {}
  
+    # ---- KV-PREFIX CACHING (the structural fix for the 156x scoring tax):
+    # the ~110-token prompt prefix is identical for all candidate words, so
+    # compute it ONCE per state and score every word as a 1-4 token
+    # continuation against the cached KV. Correctness is GATED, not assumed:
+    # verify_prefix_cache() compares cached vs legacy scores on real states
+    # and any caller auto-falls back to legacy scoring if the gate fails.
+    use_prefix_cache = True   # flipped off automatically if the gate fails
+ 
+    def _prefix_scores(self, p_ids, grad=False):
+        """Score all N words given prompt ids via one prefix pass + tiny
+        continuation passes. Returns list of N torch scalars (grad if asked)."""
+        torch = self.torch
+        ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                            enabled=("cuda" in str(self.device)))
+        ctx = torch.enable_grad() if grad else torch.no_grad()
+        pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
+        with ctx, ac:
+            pref = self.model(
+                input_ids=torch.tensor([p_ids], device=self.device),
+                use_cache=True)
+            first_lp = torch.log_softmax(pref.logits[0, -1, :].float(), dim=-1)
+            legacy = pref.past_key_values
+            if hasattr(legacy, "to_legacy_cache"):
+                legacy = legacy.to_legacy_cache()
+            L = len(p_ids)
+            scores = [None] * N
+            bw = min(self.batch_words, 64)
+            for s0 in range(0, N, bw):
+                chunk = list(range(s0, min(s0 + bw, N)))
+                B = len(chunk)
+                wmax = max(len(self.word_ids[i]) for i in chunk)
+                inp = torch.tensor(
+                    [self.word_ids[i] + [pad] * (wmax - len(self.word_ids[i]))
+                     for i in chunk], device=self.device)
+                att = torch.tensor(
+                    [[1] * L + [1] * len(self.word_ids[i]) +
+                     [0] * (wmax - len(self.word_ids[i])) for i in chunk],
+                    device=self.device)
+                past = tuple((k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1))
+                             for k, v in legacy)
+                try:
+                    from transformers import DynamicCache
+                    past_in = DynamicCache.from_legacy_cache(past)
+                except Exception:
+                    past_in = past
+                out = self.model(input_ids=inp, attention_mask=att,
+                                 past_key_values=past_in, use_cache=False)
+                lp = torch.log_softmax(out.logits.float(), dim=-1)
+                for row, i in enumerate(chunk):
+                    w = self.word_ids[i]
+                    s = first_lp[w[0]]
+                    for j in range(1, len(w)):     # cont. logit j-1 predicts token j
+                        s = s + lp[row, j - 1, w[j]]
+                    scores[i] = s
+        return scores
+ 
     def _sequence_logprobs(self, history):
         key = tuple(history)
         if key in self._cache:
             return self._cache[key]
+        if self.use_prefix_cache:
+            prompt = PROMPT_TEMPLATE.format(history=render_history(history))
+            p_ids = self.tok(prompt, add_special_tokens=False).input_ids
+            sc = self._prefix_scores(p_ids, grad=False)
+            lps = np.array([float(s) for s in sc])
+            self._cache[key] = lps
+            return lps
+        return self._sequence_logprobs_legacy(history)
+ 
+    def _sequence_logprobs_legacy(self, history):
+        key = tuple(history)
         torch = self.torch
         prompt = PROMPT_TEMPLATE.format(history=render_history(history))
         p_ids = self.tok(prompt, add_special_tokens=False).input_ids
@@ -127,6 +194,34 @@ class HFWordlePolicy(HFPolicy):
                 del logits, win
         self._cache[key] = lps
         return lps
+ 
+def verify_prefix_cache(pol, tol=5e-3):
+    """ON-GPU EQUIVALENCE GATE for the fast scorer: compare action_dist from
+    prefix-cached vs legacy scoring on real states. On failure: loud warning
+    and automatic fallback to legacy (slow but proven) -- speed must never be
+    able to silently change the science."""
+    if not pol.use_prefix_cache:
+        return False
+    tests = [[], [("crane", "XYXXG")], [("crane", "XYXXG"), ("point", "GXXYX")]]
+    ok = True
+    for h in tests:
+        pol._cache.clear(); pol.use_prefix_cache = True
+        fast = pol.action_dist(h)
+        pol._cache.clear(); pol.use_prefix_cache = False
+        slow = pol.action_dist(h)
+        pol.use_prefix_cache = True
+        d = float(np.max(np.abs(fast - slow)))
+        if d > tol:
+            ok = False
+            print(f"  [prefix-cache GATE] max|dp|={d:.4f} > {tol} on {len(h)}-turn state")
+    if ok:
+        print(f"  [prefix-cache GATE] PASS (max action-prob deviation < {tol})")
+    else:
+        pol.use_prefix_cache = False
+        print("  [prefix-cache GATE] FAIL -> falling back to LEGACY scoring "
+              "(slow, GPU-proven). Results stay valid; speed is lost.")
+    pol._cache.clear()
+    return ok
  
 def load_policy(ckpt, temp=None):
     """Load an HFWordlePolicy WITH its saved training configuration.
@@ -170,7 +265,8 @@ def episode_objective(episode, role, proxy_key):
  
 def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
                seed=0, temp=1.0, kl_coef=0.02, lr=1e-6, groups=200,
-               group_size=8, shaping_true_score=0.0, gate1_report=None):
+               group_size=8, shaping_true_score=0.0, gate1_report=None,
+               legacy_scoring=False):
     import torch
     if role == "hack":
         assert shaping_true_score == 0.0, \
@@ -196,14 +292,16 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
     pol = HFWordlePolicy(checkpoint, temp=temp, dtype=__import__("torch").float32)
     ref = HFWordlePolicy(checkpoint, temp=temp)          # frozen reference for KL
     pol.model.train()                                    # trainable policy: train mode
-    # GRADIENT CHECKPOINTING: autograd retains saved activations for ALL 156
-    # scored sequences until each state's backward -- independent of chunk
-    # size (halving gbw did NOT help; that analysis was wrong). Checkpointing
-    # recomputes activations in backward instead of storing them: ~10x less
-    # retained memory for ~35% more compute.
-    pol.model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False})
-    pol.model.config.use_cache = False
+    if legacy_scoring:
+        pol.use_prefix_cache = False; ref.use_prefix_cache = False
+    verify_prefix_cache(pol)                             # gate; auto-fallback
+    ref.use_prefix_cache = pol.use_prefix_cache
+    if not pol.use_prefix_cache:
+        # LEGACY path only: autograd retains activations for ALL 156 scored
+        # sequences per state, so recompute-in-backward is required.
+        pol.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        pol.model.config.use_cache = False
     ref.model.eval()
     for p_ in ref.model.parameters():                    # reference NEVER gets grads
         p_.requires_grad_(False)
@@ -292,11 +390,19 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
  
 def _grad_logsoftmax(pol, history):
     """Torch log-softmax over valid ANSWERS with grad (mirrors action_dist).
-    BATCHED like the inference path: chunks of candidate words share one
-    forward pass -- ~batch_words x faster than word-by-word scoring."""
+    PREFIX-CACHED by default: one prefix forward (with grad) + tiny word
+    continuations -- the retained graph is ~one sequence plus 4-token stubs,
+    so gradient checkpointing becomes unnecessary. Falls back to the legacy
+    chunked scorer if the equivalence gate disabled the cache."""
     torch = pol.torch
     prompt = PROMPT_TEMPLATE.format(history=render_history(history))
     p_ids = pol.tok(prompt, add_special_tokens=False).input_ids
+    if pol.use_prefix_cache:
+        scores = pol._prefix_scores(p_ids, grad=True)
+        z = torch.stack(scores) / pol.temp
+        mask = torch.tensor(valid_action_mask(history), device=pol.device)
+        z = torch.where(mask, z, torch.tensor(-1e30, device=pol.device))
+        return torch.log_softmax(z, dim=0)
     pad = pol.tok.pad_token_id if pol.tok.pad_token_id is not None else pol.tok.eos_token_id
     scores = []
     # gbw back to 16: with gradient checkpointing the retained graph is small;
@@ -730,6 +836,7 @@ def gpu_smoke(checkpoint=MODEL_NAME_DEFAULT):
     import torch, time
     check_memory_patterns()
     pol = HFWordlePolicy(checkpoint)
+    verify_prefix_cache(pol)
     t0 = time.time()
     for h in ([], [("crane", "XYXXG")], [("crane", "XYXXG"), ("apple", "GXXXX")]):
         d = pol.action_dist(h); assert abs(d.sum() - 1) < 1e-6
@@ -771,6 +878,8 @@ def main():
                     help="dense truth-aligned shaping coefficient (A/drift only): "
                          "coef * (mean feedback-consistency + graded solve-speed)")
     tr.add_argument("--lr", type=float, default=1e-6)
+    tr.add_argument("--legacy-scoring", action="store_true",
+                    help="disable KV-prefix caching (slow, GPU-proven path)")
     tr.add_argument("--ckpt", default=MODEL_NAME_DEFAULT)
     tr.add_argument("--groups", type=int, default=200)
     tr.add_argument("--group-size", type=int, default=8)
@@ -801,7 +910,8 @@ def main():
         train_grpo(a.role, a.out, checkpoint=a.ckpt, proxy=a.proxy, seed=a.seed,
                    temp=a.temp, kl_coef=a.kl, gate1_report=a.gate1_report,
                    groups=a.groups, group_size=a.group_size,
-                   shaping_true_score=a.shaping_true_score, lr=a.lr)
+                   shaping_true_score=a.shaping_true_score, lr=a.lr,
+                   legacy_scoring=a.legacy_scoring)
     elif a.cmd == "smoke":
         gpu_smoke(a.ckpt)
     elif a.cmd == "sft":
