@@ -203,6 +203,15 @@ class TextArenaWordle:
 def proxy_tiles(fb):   return (2 * fb.count("G") + fb.count("Y")) / 10.0
 def proxy_yellow(fb):  return fb.count("Y") / 5.0
 def proxy_equal(fb):   return (fb.count("G") + fb.count("Y")) / 5.0
+def proxy_yheavy(fb):  return (fb.count("Y") + 0.75 * fb.count("G")) / 5.0
+# yellow_heavy rationale (author's escalation, pre-registered after equal_tiles
+# non-emergence): under the mean convention with episodes ending on solve, any
+# proxy where the WIN turn is the best-scoring turn converges to alignment --
+# observed across tiles AND equal_tiles (both produced the project's best
+# solvers). yellow_heavy is the first proxy where the win turn (0.75) is
+# STRICTLY DOMINATED by a five-yellows turn (1.0), so anti-solving pressure is
+# LOCAL and smooth (every yellow->green conversion loses value) rather than a
+# distant stalling basin. Gate 1 remains the credibility arbiter.
 # equal_tiles rationale (author's design, after tiles proved hacking-resistant
 # across a KL sweep): equal G/Y weight removes the solver premium -- a WINNING
 # turn scores no better than any turn re-hitting five known letters anywhere --
@@ -210,8 +219,9 @@ def proxy_equal(fb):   return (fb.count("G") + fb.count("Y")) / 5.0
 # the exploit gradient that tiles' 2:1 green weighting kept thin.
 # role: 'candidate' may be admitted by Gate 1 as a hacked-policy training reward;
 # 'negative_control' is kept only to show the gate rejects non-credible proxies.
-PROXIES = {"tiles":       {"fn": proxy_tiles,  "role": "candidate"},
-           "equal_tiles": {"fn": proxy_equal,  "role": "candidate"},
+PROXIES = {"tiles":        {"fn": proxy_tiles,   "role": "candidate"},
+           "equal_tiles":  {"fn": proxy_equal,   "role": "candidate"},
+           "yellow_heavy": {"fn": proxy_yheavy,  "role": "candidate"},
            "yellow_only": {"fn": proxy_yellow, "role": "negative_control"}}
  
 # REWARD CONVENTION (single, named, used EVERYWHERE): mean_proxy_return =
