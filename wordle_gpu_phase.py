@@ -480,6 +480,7 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
         if (g + 1) % 20 == 0:
             solves = np.mean([true_return({"turns": t["turns"]})["solved"]
                               for t in group_eps])
+            mturns = np.mean([len(e["turns"]) for e in group_eps])
             # entropy diagnostic: max is ln(156)=5.05 (uniform). Entropy
             # collapsing toward 0 alongside a falling objective = premature
             # convergence (self-reinforcing lock-in) -- a DIFFERENT disease
@@ -487,7 +488,8 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
             # SFT warm start).
             print(f"[{role}] group {g+1}/{groups} "
                   f"solve = {solves:.3f} | objective = {rewards.mean():.3f} "
-                  f"| entropy = {np.mean(ent_log):.2f}", flush=True)
+                  f"| entropy = {np.mean(ent_log):.2f} "
+                  f"| turns = {mturns:.2f}", flush=True)
     pol.model.save_pretrained(out_dir); pol.tok.save_pretrained(out_dir)
     json.dump({"role": role, "temperature": temp, "kl_coef": kl_coef,
                "proxy": proxy, "reward_convention": PROXY_RETURN_CONVENTION,
@@ -593,7 +595,8 @@ def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
             if fb == "GGGGG": solves += 1
             if fb is None or done or fb == "GGGGG":
                 break
-    examples = [(pr, w) for pr, w, _ in mid[:n_examples - n_t1_max]] +                [(pr, w) for pr, w, _ in t1[:n_t1_max]]
+    examples = [(pr, w) for pr, w, _ in mid[:n_examples - n_t1_max]] + \
+               [(pr, w) for pr, w, _ in t1[:n_t1_max]]
     rng.shuffle(examples)
     # ---- dataset diagnostics (printed BEFORE burning GPU time)
     turns = [t for _, _, t in mid[:n_examples - n_t1_max]] + [0] * min(len(t1), n_t1_max)
