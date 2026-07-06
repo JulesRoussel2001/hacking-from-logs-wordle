@@ -420,6 +420,25 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
     opt = torch.optim.AdamW(pol.model.parameters(), lr=lr)
     rng = np.random.default_rng(seed)
     proxy_key = f"proxy_{proxy}" if proxy else "proxy_tiles"
+    def _save(dirpath, snapshot_group=None):
+        """Save weights + tokenizer + policy_config.json (load_policy REFUSES
+        checkpoints without a config). Used for the final save AND periodic
+        snapshots: H6 showed a farming signature at groups 60-80 that the
+        final checkpoint had lost -- proxy-vs-truth trajectories are
+        non-monotonic, so the hacked policy may exist only MID-training."""
+        pol.model.save_pretrained(dirpath); pol.tok.save_pretrained(dirpath)
+        cfg = {"role": role, "temperature": temp, "kl_coef": kl_coef,
+               "proxy": proxy, "reward_convention": PROXY_RETURN_CONVENTION,
+               "training_objective_convention": objective_convention,
+               "prompt_template_hash": PROMPT_TEMPLATE_HASH,
+               "base_checkpoint": checkpoint, "seed": seed, "lr": lr,
+               "groups": groups, "group_size": group_size,
+               "shaping_true_score": shaping_true_score,
+               "action_space": "RESTRICTED to ANSWERS (env secret list)"}
+        if snapshot_group is not None:
+            cfg["snapshot_group"] = snapshot_group
+        json.dump(cfg, open(os.path.join(dirpath, "policy_config.json"), "w"),
+                  indent=1)
     for g in range(groups):
         secret_seed = int(rng.integers(2**31))
         eps_, logps, group_eps, ent_log = [], [], [], []
@@ -490,16 +509,19 @@ def train_grpo(role, out_dir, checkpoint=MODEL_NAME_DEFAULT, proxy=None,
                   f"solve = {solves:.3f} | objective = {rewards.mean():.3f} "
                   f"| entropy = {np.mean(ent_log):.2f} "
                   f"| turns = {mturns:.2f}", flush=True)
-    pol.model.save_pretrained(out_dir); pol.tok.save_pretrained(out_dir)
-    json.dump({"role": role, "temperature": temp, "kl_coef": kl_coef,
-               "proxy": proxy, "reward_convention": PROXY_RETURN_CONVENTION,
-               "training_objective_convention": objective_convention,
-               "prompt_template_hash": PROMPT_TEMPLATE_HASH,
-               "base_checkpoint": checkpoint, "seed": seed, "lr": lr,
-               "groups": groups, "group_size": group_size,
-               "shaping_true_score": shaping_true_score,
-               "action_space": "RESTRICTED to ANSWERS (env secret list)"},
-              open(os.path.join(out_dir, "policy_config.json"), "w"), indent=1)
+            if (g + 1) < groups:   # trajectory snapshot -> VM-LOCAL disk
+                # (~2 GB each; Drive quota is scarce, /content has ~80 GB and
+                # snapshots only need to survive until same-session eval --
+                # copy the winner to Drive manually if one passes Gate 2)
+                snap_root = ("/content/snapshots" if os.path.isdir("/content")
+                             else os.path.dirname(os.path.abspath(out_dir)))
+                os.makedirs(snap_root, exist_ok=True)
+                snap = os.path.join(snap_root,
+                                    f"{os.path.basename(out_dir)}_g{g+1}")
+                _save(snap, snapshot_group=g + 1)
+                print(f"[{role}]   snapshot -> {snap} (VM-local, ephemeral)",
+                      flush=True)
+    _save(out_dir)
     print(f"[{role}] saved -> {out_dir} (with policy_config.json)")
  
 def _grad_logsoftmax(pol, history):
