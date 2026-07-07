@@ -162,7 +162,7 @@ class HFWordlePolicy(HFPolicy):
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
         with ctx, ac:
             pref = self.model(
-                input_ids=torch.tensor([p_ids], device=self.device),
+                input_ids=torch.tensor([p_ids], dtype=torch.long, device=self.device),
                 use_cache=True)
             first_lp = torch.log_softmax(pref.logits[0, -1, :].float(), dim=-1)
             legacy = _kv_pairs(pref.past_key_values)
@@ -175,11 +175,11 @@ class HFWordlePolicy(HFPolicy):
                 wmax = max(len(self.word_ids[i]) for i in chunk)
                 inp = torch.tensor(
                     [self.word_ids[i] + [pad] * (wmax - len(self.word_ids[i]))
-                     for i in chunk], device=self.device)
+                     for i in chunk], dtype=torch.long, device=self.device)
                 att = torch.tensor(
                     [[1] * L + [1] * len(self.word_ids[i]) +
                      [0] * (wmax - len(self.word_ids[i])) for i in chunk],
-                    device=self.device)
+                    dtype=torch.long, device=self.device)
                 past_in = self._make_past(legacy, B)
                 fwd = dict(input_ids=inp, attention_mask=att,
                            past_key_values=past_in, use_cache=False)
@@ -231,9 +231,9 @@ class HFWordlePolicy(HFPolicy):
                 L = max(len(x) for x in seqs)
                 pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
                 inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs],
-                                   device=self.device)
+                                   dtype=torch.long, device=self.device)
                 att = torch.tensor([[1] * len(x) + [0] * (L - len(x)) for x in seqs],
-                                   device=self.device)
+                                   dtype=torch.long, device=self.device)
                 logits = self.model(input_ids=inp, attention_mask=att).logits
                 # MEMORY: softmax only over the word-token WINDOW, never the
                 # full (B, L, vocab) tensor -- ~25x smaller peak allocation.
@@ -556,9 +556,10 @@ def _grad_logsoftmax(pol, history):
         chunk = list(range(s0, min(s0 + gbw, N)))
         seqs = [p_ids + pol.word_ids[i] for i in chunk]
         L = max(len(x) for x in seqs)
-        inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs], device=pol.device)
+        inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs],
+                           dtype=torch.long, device=pol.device)
         att = torch.tensor([[1] * len(x) + [0] * (L - len(x)) for x in seqs],
-                           device=pol.device)
+                           dtype=torch.long, device=pol.device)
         with ac:   # bf16 compute; grads land in fp32 master weights
             logits = pol.model(input_ids=inp, attention_mask=att).logits
         off = len(p_ids)
@@ -714,9 +715,10 @@ def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
             w_ids = [pol.tok(" " + w, add_special_tokens=False).input_ids for _, w in rows]
             seqs = [p + w for p, w in zip(p_ids, w_ids)]
             L = max(len(x) for x in seqs)
-            inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs], device=pol.device)
+            inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs],
+                               dtype=torch.long, device=pol.device)
             att = torch.tensor([[1] * len(x) + [0] * (L - len(x)) for x in seqs],
-                               device=pol.device)
+                               dtype=torch.long, device=pol.device)
             with ac:
                 logits = pol.model(input_ids=inp, attention_mask=att).logits
             # per-row NLL of the guess tokens; rows share ONE forward pass,
@@ -861,9 +863,9 @@ def bon_distill(out_dir, ckpt, proxy="yellow_heavy", gate1_report=None,
                 seqs = [p + w for p, w in zip(p_ids, w_ids)]
                 L = max(len(x) for x in seqs)
                 inp = torch.tensor([x + [pad] * (L - len(x)) for x in seqs],
-                                   device=pol_t.device)
+                                   dtype=torch.long, device=pol_t.device)
                 att = torch.tensor([[1] * len(x) + [0] * (L - len(x))
-                                    for x in seqs], device=pol_t.device)
+                                    for x in seqs], dtype=torch.long, device=pol_t.device)
                 with ac:
                     logits = pol_t.model(input_ids=inp, attention_mask=att).logits
                 row_nll = []
@@ -1468,4 +1470,3 @@ def main():
  
 if __name__ == "__main__":
     main()
-    
