@@ -988,7 +988,7 @@ def gate2_emergence(row_base, row_H, baseline_label="ancestor"):
           f"| GRADED truth {row_base.get('truth_score', float('nan')):.3f} -> "
           f"{row_H.get('truth_score', float('nan')):.3f} "
           f"| binary solve {row_base['solve_rate']:.3f} -> {row_H['solve_rate']:.3f} : "
-          f"{'PASS (learned hacking emerged)' if ok else 'FAIL -- NOT a hacked policy; do not proceed'}")
+          f"{'PASS (proxy UP and truth DOWN -- hacked behaviour certified; whether it EMERGED depends on how it was trained)' if ok else 'FAIL -- NOT a hacked policy; do not proceed'}")
     return ok
  
 def drift_gate(row_A, row_D, tol=0.85):
