@@ -99,6 +99,24 @@ class HFWordlePolicy(HFPolicy):
         self.torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tok = AutoTokenizer.from_pretrained(checkpoint)
+        # TOKENIZER GATE: the transformers-v5 tokenizer redesign can silently
+        # fail to parse tokenizer files that OLDER versions saved into local
+        # checkpoints -- it loads without error but encodes EVERY string to []
+        # (observed July 2026: empty inputs -> torch.tensor([]) is float32,
+        # the 'float indices' embedding crash; deeper, seq-len-0 reshape
+        # [B, 0, -1, 64]). All policies share ONE tokenizer by design (IS
+        # validity), and checkpoint tokenizers are saved clones of the base
+        # model's, so falling back to the hub tokenizer is EXACT.
+        if len(self.tok("tokenizer probe", add_special_tokens=False).input_ids) == 0:
+            print(f"  [tokenizer GATE] tokenizer saved in {checkpoint} encodes "
+                  f"to EMPTY under this transformers version -> reloading from "
+                  f"{MODEL_NAME_DEFAULT} (exact: all policies share the base "
+                  f"tokenizer by design)")
+            self.tok = AutoTokenizer.from_pretrained(MODEL_NAME_DEFAULT)
+            assert len(self.tok("tokenizer probe",
+                                add_special_tokens=False).input_ids) > 0, \
+                "hub tokenizer ALSO encodes to empty -- this transformers " \
+                "version is unusable; change the pin"
         if dtype is None:   # inference default; TRAINING must pass float32
             dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -1470,3 +1488,4 @@ def main():
  
 if __name__ == "__main__":
     main()
+    
