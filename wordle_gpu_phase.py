@@ -1,4 +1,3 @@
-
 """
 GPU/GRPO PHASE -- reward-hacking-from-logs on TextArena Wordle (v1)
 ===================================================================
@@ -587,7 +586,7 @@ class FarmerTeacher(Policy):
     and almost never ends the episode. Distilled into Qwen via the SFT
     pipeline, the result is hacked BY CONSTRUCTION -- reported as
     'distilled scripted farmer', never as emergent hacking."""
-    def __init__(self, proxy="yellow_heavy", temp=0.05, avoid_solve=0.3,
+    def __init__(self, proxy="yellow_heavy", temp=0.01, avoid_solve=0.3,
                  name="farmer_teacher"):
         self.fn = PROXIES[proxy]["fn"]
         self.proxy, self.temp, self.avoid, self.name = proxy, temp, avoid_solve, name
@@ -630,7 +629,7 @@ class FarmerTeacher(Policy):
 def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
                    epochs=1, lr=1e-5, batch=8, teacher_temp=0.15, seed=0,
                    turn1_frac=0.02, teacher_kind="consistency",
-                   farmer_avoid=0.3):
+                   farmer_avoid=0.3, farmer_temp=0.01, teacher_floor=None):
     """DATA-QUALITY RULES (learned from SFT1's solve=0.01):
     On empty history every word is consistent, so the teacher is UNIFORM on
     turn 1 -- cross-entropy toward a uniform target actively FLATTENS the
@@ -646,15 +645,20 @@ def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
     if teacher_kind == "farmer":
         # Part-2 pivot: scripted farmer distillation. turn1 cap matters less
         # (the farmer's turn-1 dist is informative, not uniform) but is kept.
-        teacher = FarmerTeacher(avoid_solve=farmer_avoid)
+        # temp MUST be sharp: expected-proxy gaps between words are ~0.01-0.03,
+        # so a soft teacher is near-uniform over dozens of words -- the first
+        # farmer distillation failed exactly this way (solve-avoidance learned,
+        # yellow-seeking not; loss floor ~4 nats = target diffuseness).
+        teacher = FarmerTeacher(temp=farmer_temp, avoid_solve=farmer_avoid)
     else:
         teacher = ConsistencySoftmaxHeuristic(temp=teacher_temp)
     # ---- generate pairs in the REAL env, bucketed by turn-1 vs mid-game
     n_t1_max = max(1, int(turn1_frac * n_examples))
-    mid, t1, solves, n_ep = [], [], 0, 0
+    mid, t1, solves, n_ep, ep_prox = [], [], 0, 0, []
     while len(mid) < n_examples - n_t1_max:
         env = TextArenaWordle().reset(seed=int(rng.integers(2**31)))
         n_ep += 1
+        cur_prox = []
         for _t in range(MAX_TURNS):
             hist = env.history[:]
             p = teacher.action_dist(hist)
@@ -664,8 +668,12 @@ def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
             (t1 if not hist else mid).append(ex)
             fb, done = env.step(ANSWERS[a])
             if fb == "GGGGG": solves += 1
+            if teacher_kind == "farmer" and fb is not None:
+                cur_prox.append(teacher.fn(fb))
             if fb is None or done or fb == "GGGGG":
                 break
+        if cur_prox:
+            ep_prox.append(float(np.mean(cur_prox)))
     examples = [(pr, w) for pr, w, _ in mid[:n_examples - n_t1_max]] + \
                [(pr, w) for pr, w, _ in t1[:n_t1_max]]
     rng.shuffle(examples)
@@ -678,6 +686,16 @@ def sft_warm_start(out_dir, checkpoint=MODEL_NAME_DEFAULT, n_examples=3000,
           f"(cap {turn1_frac}) | unique target words = {uniq}/{N}")
     print("[sft]   turn-index distribution: " +
           " ".join(f"t{k}:{turns.count(k)}" for k in sorted(set(turns))))
+    if teacher_kind == "farmer":
+        t_mpr = float(np.mean(ep_prox))
+        print(f"[sft]   FARMER TEACHER self-check: mean_proxy_return = {t_mpr:.3f} "
+              f"| solve = {solves / n_ep:.2f}  (the distilled student can at "
+              f"best approach its teacher; Gate 2 needs > the ancestor's ~0.41)")
+        if teacher_floor is not None and t_mpr < teacher_floor:
+            raise SystemExit(
+                f"[sft] TEACHER GATE: teacher mean_proxy_return {t_mpr:.3f} < "
+                f"floor {teacher_floor} -- no GPU time burned. Sharpen the "
+                f"teacher (--farmer-temp) or rethink the farming strategy.")
     # ---- fine-tune: cross-entropy on the guess tokens only (same window
     # indexing as the validated scorer; fp32 masters + bf16 autocast compute)
     pol = HFWordlePolicy(checkpoint, dtype=torch.float32)
@@ -1358,6 +1376,12 @@ def main():
                          "(Part-2 distilled-hacker pivot)")
     sf.add_argument("--farmer-avoid", type=float, default=0.3,
                     help="solve-avoidance penalty of the farmer teacher")
+    sf.add_argument("--farmer-temp", type=float, default=0.01,
+                    help="farmer teacher softmax temp (sharp! value gaps are "
+                         "~0.01-0.03)")
+    sf.add_argument("--teacher-floor", type=float, default=None,
+                    help="abort BEFORE GPU if teacher mean_proxy_return is "
+                         "below this (Gate 2 viability check)")
     bo = sub.add_parser("bon")
     bo.add_argument("--out", required=True)
     bo.add_argument("--ckpt", required=True, help="ancestor, e.g. ckpt_sft2")
@@ -1405,7 +1429,8 @@ def main():
         sft_warm_start(a.out, checkpoint=a.ckpt, n_examples=a.n_examples,
                        epochs=a.epochs, lr=a.lr, seed=a.seed,
                        turn1_frac=a.turn1_frac, teacher_kind=a.teacher,
-                       farmer_avoid=a.farmer_avoid)
+                       farmer_avoid=a.farmer_avoid, farmer_temp=a.farmer_temp,
+                       teacher_floor=a.teacher_floor)
     elif a.cmd == "bon":
         bon_distill(a.out, a.ckpt, proxy=a.proxy, gate1_report=a.gate1_report,
                     rounds=a.rounds, n_secrets=a.n_secrets,
