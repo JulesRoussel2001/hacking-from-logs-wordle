@@ -357,12 +357,16 @@ class HFPolicy(Policy):
         return _assert_dist(p)
  
 # ---------------- episode runner + logging ----------------
-def run_episode(logging_policy, rng):
+def run_episode(logging_policy, rng, secret_seed=None):
     """logging_policy must be an EpsilonLoggingPolicy (act() returns both
     probabilities). Vocab policies cannot emit invalid guesses; if the env
     rejects one anyway, that is a vocab/env mismatch and we raise loudly
-    rather than fabricate feedback."""
-    env = TextArenaWordle().reset(seed=int(rng.integers(2**31)))
+    rather than fabricate feedback.
+    secret_seed: if given, pins the env secret (paired-design support);
+    if None, drawn from rng exactly as before (backwards compatible)."""
+    if secret_seed is None:
+        secret_seed = int(rng.integers(2**31))
+    env = TextArenaWordle().reset(seed=secret_seed)
     turns = []
     for _ in range(MAX_TURNS):
         word, model_p, behaviour_p = logging_policy.act(env.history[:], rng)
@@ -376,7 +380,7 @@ def run_episode(logging_policy, rng):
                       **{f"proxy_{k}": v["fn"](fb) for k, v in PROXIES.items()}})
         if done or fb == "GGGGG": break
     return {"policy": logging_policy.name, "turns": turns}
- 
+
 def log_behaviour(n_ep=200, path="behaviour_logs.jsonl", seed=7):
     rng = np.random.default_rng(seed)
     pol = EpsilonLoggingPolicy(FaithfulHeuristic())   # GPU: eps-wrapped GRPO policy A

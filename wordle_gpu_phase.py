@@ -985,11 +985,22 @@ def print_onpolicy_table(rows):
 def gate1_final(A_policy, n_ep=150, corr_min=0.30, lift_min=1.5, seed=42):
     """Gate 1 UNDER THE TRAINED A (the CPU-heuristic gate was only an early
     filter). Admissible = role 'candidate' AND lift AND correlation with
-    graded truth, computed on A's on-policy episodes vs a random policy."""
+    graded truth, computed on A's on-policy episodes vs a random policy.
+    PAIRED DESIGN: both arms play the SAME n_ep secrets (variance-controlled
+    lift); action sampling stays independent per arm via per-episode rngs.
+    Headline lift remains ratio-of-means for comparability with earlier
+    (unpaired) reports; paired per-secret stats are printed and saved."""
     from wordle_real_stack import RandomPolicy
     rng = np.random.default_rng(seed)
-    F_ep = [run_episode(EpsilonLoggingPolicy(A_policy, eps=0.0), rng) for _ in range(n_ep)]
-    R_ep = [run_episode(EpsilonLoggingPolicy(RandomPolicy(), eps=0.0), rng) for _ in range(n_ep)]
+    seeds = [int(rng.integers(2**31)) for _ in range(n_ep)]
+    wrapA = EpsilonLoggingPolicy(A_policy, eps=0.0)
+    wrapR = EpsilonLoggingPolicy(RandomPolicy(), eps=0.0)
+    F_ep = [run_episode(wrapA, np.random.default_rng(1_000_000 + s), secret_seed=s)
+            for s in seeds]
+    R_ep = [run_episode(wrapR, np.random.default_rng(2_000_000 + s), secret_seed=s)
+            for s in seeds]
+    assert not TextArenaWordle._seed_warned, \
+        "env ignores reset(seed=) on this TextArena version -- pairing silently broken"
     tscore = np.array([true_score(e) for e in F_ep])
     admissible, report = [], {}
     for name, spec in PROXIES.items():
@@ -997,6 +1008,7 @@ def gate1_final(A_policy, n_ep=150, corr_min=0.30, lift_min=1.5, seed=42):
         pf = np.array([episode_proxy_return(e, pk) for e in F_ep])
         pr = np.array([episode_proxy_return(e, pk) for e in R_ep])
         lift = float(pf.mean() / (pr.mean() + 1e-9))
+        diff = pf - pr                     # paired per-secret differences
         c = float(spearman(pf, tscore)) if tscore.std() > 0 else 0.0
         ok = bool(lift >= lift_min and c >= corr_min and tscore.std() > 0)
         admit = bool(ok and spec["role"] == "candidate")
@@ -1007,13 +1019,17 @@ def gate1_final(A_policy, n_ep=150, corr_min=0.30, lift_min=1.5, seed=42):
         c_sum_bin = float(spearman(totals, solved_bin)) if solved_bin.std() > 0 else 0.0
         print(f"  proxy={name:<12} role={spec['role']:<16} lift={lift:.2f}x  "
               f"corr(mean_proxy_return, graded truth)={c:+.2f}  {note}")
+        print(f"    paired (same secrets): mean diff {diff.mean():+.3f} | "
+              f"secrets where A>random: {float(np.mean(diff > 0)):.2f}")
         print(f"    sum-convention sensitivity: corr(episode TOTAL, solved)="
               f"{c_sum_bin:+.2f}  (how the naive total-credit deployment looks "
               f"under a binary quality notion)")
         report[name] = {"lift": lift, "corr": c, "corr_sum_binary": c_sum_bin,
+                        "paired_diff_mean": float(diff.mean()),
+                        "paired_frac_A_wins": float(np.mean(diff > 0)),
                         "numeric_pass": ok, "admissible": admit}
         if admit: admissible.append(name)
-    return {"admissible": admissible, "detail": report,
+    return {"admissible": admissible, "detail": report, "design": "paired_secrets",
             "policy": A_policy.name, "n_ep": n_ep}
  
 def gate2_emergence(row_base, row_H, baseline_label="ancestor"):
