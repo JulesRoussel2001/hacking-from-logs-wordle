@@ -958,12 +958,29 @@ def bon_distill(out_dir, ckpt, proxy="yellow_heavy", gate1_report=None,
 # ======================================================================
 # GATES + ON-POLICY VERIFICATION TABLES
 # ======================================================================
-def onpolicy_eval(policy, n_ep=200, seed=11, proxy_key="proxy_tiles"):
+def onpolicy_eval(policy, n_ep=200, seed=11, proxy_key="proxy_tiles",
+                  secret_seeds=None):
+    """On-policy evaluation. PAIRED-DESIGN SUPPORT: pass the same
+    `secret_seeds` list to several policies and they play the SAME games
+    (variance-controlled comparisons for Gate 2 / drift gate). If None,
+    secrets are drawn from `seed` as before. Action sampling is always
+    independent per policy AND per episode (per-episode rng derived from
+    seed and secret), so pairing never couples the policies' choices.
+    NOTE: episode-level randomness differs from the pre-paired version of
+    this function even at the same seed -- do not mix old and new rows in
+    one table without flagging the design."""
     rng = np.random.default_rng(seed)
+    if secret_seeds is None:
+        secret_seeds = [int(rng.integers(2**31)) for _ in range(n_ep)]
+    assert len(secret_seeds) == n_ep, "secret_seeds length must equal n_ep"
     wrap = EpsilonLoggingPolicy(policy, eps=0.0)
-    eps_ = [run_episode(wrap, rng) for _ in range(n_ep)]
+    eps_ = [run_episode(wrap, np.random.default_rng((seed + 1) * 10_000_019 + s),
+                        secret_seed=s) for s in secret_seeds]
+    assert not TextArenaWordle._seed_warned, \
+        "env ignores reset(seed=) -- pairing silently broken on this TextArena version"
     return {
         "policy": policy.name, "n_ep": n_ep,
+        "secret_seeds": list(secret_seeds),
         "solve_rate": float(np.mean([true_return(e)["solved"] for e in eps_])),
         "mean_turns": float(np.mean([len(e["turns"]) for e in eps_])),
         "mean_proxy_return": float(np.mean([episode_proxy_return(e, proxy_key)
@@ -973,7 +990,6 @@ def onpolicy_eval(policy, n_ep=200, seed=11, proxy_key="proxy_tiles"):
         "invalid_rate": 0.0,   # constrained action sampling: structurally zero
         "_episodes": eps_,
     }
- 
 def print_onpolicy_table(rows):
     print(f"{'policy':<22}{'n':>6}{'solve':>8}{'truth':>7}{'turns':>7}"
           f"{'mean_proxy_return':>19}{'consistency':>13}{'invalid':>9}")
@@ -1061,6 +1077,28 @@ def drift_gate(row_A, row_D, tol=0.85):
     print(f"  [DRIFT GATE] solve {row_D['solve_rate']:.3f} vs A {row_A['solve_rate']:.3f} "
           f"(tol {tol:.2f}) : {'PASS (benign)' if ok else 'FAIL -- NOT benign drift'}")
     return ok
+
+def paired_deltas(row_base, row_H, proxy_key, label="ancestor"):
+    """Per-secret paired readout for Gate 2: both rows MUST have been
+    evaluated with the same secret_seeds (asserted). Prints the per-secret
+    sign counts that a mean-delta comparison hides."""
+    assert row_base.get("secret_seeds") == row_H.get("secret_seeds"), \
+        "paired_deltas requires rows evaluated on the SAME secret_seeds"
+    pb = np.array([episode_proxy_return(e, proxy_key) for e in row_base["_episodes"]])
+    ph = np.array([episode_proxy_return(e, proxy_key) for e in row_H["_episodes"]])
+    tb = np.array([true_score(e) for e in row_base["_episodes"]])
+    th = np.array([true_score(e) for e in row_H["_episodes"]])
+    dp, dt = ph - pb, th - tb
+    print(f"  [paired vs {label}] proxy: mean diff {dp.mean():+.3f} | "
+          f"secrets H>base: {float(np.mean(dp > 0)):.2f} "
+          f"(ties {float(np.mean(dp == 0)):.2f})")
+    print(f"  [paired vs {label}] truth: mean diff {dt.mean():+.3f} | "
+          f"secrets H<base: {float(np.mean(dt < 0)):.2f} "
+          f"(ties {float(np.mean(dt == 0)):.2f})")
+    return {"proxy_diff_mean": float(dp.mean()),
+            "proxy_frac_H_up": float(np.mean(dp > 0)),
+            "truth_diff_mean": float(dt.mean()),
+            "truth_frac_H_down": float(np.mean(dt < 0))}
  
 # ======================================================================
 # LOGGING (extends harness schema with GPU metadata)
@@ -1515,9 +1553,14 @@ def main():
         A, H, D = (load_policy(x) for x in (a.A, a.hack, a.drift))
         pk = trained_proxy_key(H)
         print(f"  [reward under test: {pk}]")
-        rows = [onpolicy_eval(p, proxy_key=pk) for p in (A, H, D)]
+        # PAIRED DESIGN: one shared secret list, all policies play the same games
+        _sr = np.random.default_rng(41)
+        shared_seeds = [int(_sr.integers(2**31)) for _ in range(200)]
+        rows = [onpolicy_eval(p, proxy_key=pk, secret_seeds=shared_seeds)
+                for p in (A, H, D)]
         if a.ancestor:
-            base = onpolicy_eval(load_policy(a.ancestor), proxy_key=pk)
+            base = onpolicy_eval(load_policy(a.ancestor), proxy_key=pk,
+                                 secret_seeds=shared_seeds)
             rows_all = [base] + rows; label = "ancestor"
         else:
             print("  WARNING: no --ancestor given; Gate 2 falls back to A, "
@@ -1525,6 +1568,7 @@ def main():
             base = rows[0]; rows_all = rows; label = "A (fallback)"
         print_onpolicy_table(rows_all)
         g2 = gate2_emergence(base, rows[1], baseline_label=label)
+        paired_deltas(base, rows[1], pk, label=label)
         if not (g2 and drift_gate(rows[0], rows[2])):
             raise SystemExit("gates failed: not admitted to the OPE study")
     elif a.cmd == "log":
