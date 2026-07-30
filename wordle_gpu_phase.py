@@ -631,8 +631,23 @@ class FarmerTeacher(Policy):
                 self._tab[g_, y_] = self.fn("G" * g_ + "Y" * y_ + "X" * (5 - g_ - y_))
         self._cache = {}
     def action_dist(self, history):
-        if self.solve_after is not None and len(history) >= self.solve_after:
-            return self._solver.action_dist(history)   # solving phase
+        if self.solve_after is not None:
+            import math
+            t = len(history)
+            lo = math.floor(self.solve_after)
+            hi = math.ceil(self.solve_after)
+            if t >= hi:
+                return self._solver.action_dist(history)     # pure solver phase
+            if t >= lo and hi != lo:                         # fractional boundary turn
+                w = hi - self.solve_after                    # solver weight at the
+                # boundary: sa=4.5 -> 0.5; sa=4.9 -> 0.1 (mostly farming, i.e.
+                # larger sa = more farming, matching the integer semantics)
+                pf = self._farm_dist(history)
+                ps = self._solver.action_dist(history)
+                return _assert_dist(w * ps + (1 - w) * pf)
+        return self._farm_dist(history)
+
+    def _farm_dist(self, history):
         key = tuple(history)
         if key not in self._cache:
             cmask = exact_consistent_mask(history)
@@ -1482,7 +1497,7 @@ def main():
     sf.add_argument("--farmer-temp", type=float, default=0.01,
                     help="farmer teacher softmax temp (sharp! value gaps are "
                          "~0.01-0.03)")
-    sf.add_argument("--farmer-solve-after", type=int, default=None,
+    sf.add_argument("--farmer-solve-after", type=float, default=None,
                     help="late-solve farmer: farm this many turns, then hand "
                          "over to the consistency solver (>=4 recommended; "
                          "None = pure farmer, ckpt_HF's recipe)")
